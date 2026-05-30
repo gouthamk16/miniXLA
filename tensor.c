@@ -96,6 +96,52 @@ Tensor* relu(const Tensor* x) {
     return result;
 }
 
+Tensor* matmul(const Tensor* a, const Tensor* b) {
+    // Multupliying batch dimensions in parallel?
+    int M = a->shape[a->ndim-2];
+    int K = a->shape[a->ndim-1];
+    int N = b->shape[b->ndim-1];
+
+    if (a->ndim != b->ndim || b->shape[b->ndim-2] != K) {
+        fprintf(stderr, "Incompatible shapes for matmul: [%d,%d] x [%d,%d]\n",
+                a->shape[a->ndim-2], a->shape[a->ndim-1],
+                b->shape[b->ndim-2], b->shape[b->ndim-1]);
+        return NULL;
+    }
+
+    size_t batch_size = a->size / (a->shape[a->ndim-2] * a->shape[a->ndim-1]);
+
+    int* out_shape = (int*)malloc(a->ndim * sizeof(int));
+    if (!out_shape) {
+        fprintf(stderr, "Failed to allocate memory for output shape\n");
+        return NULL;
+    }
+    memcpy(out_shape, a->shape, a->ndim * sizeof(int));
+    out_shape[a->ndim-1] = N;
+    Tensor* result = create_tensor(NULL, out_shape, a->ndim);
+    free(out_shape);
+    if (!result) {
+        fprintf(stderr, "Failed to create tensor to store the result\n");
+        return NULL;
+    }
+    memset(result->data, 0, result->size * sizeof(float));
+
+    for (size_t bt = 0; bt < batch_size; bt++) {
+        const float* A = a->data + bt * M * K;
+        const float* B = b->data + bt * K * N;
+        float* C = result->data + bt * M * N;
+        for (int i = 0; i < M; i++) {
+            for (int k = 0; k < K; k++) {
+                float aik = A[i * K + k];
+                for (int j = 0; j < N; j++) {
+                    C[i * N + j] += aik * B[k * N + j];
+                }
+            }
+        }
+    }
+    return result;
+}
+
 size_t tensor_offset(Tensor* tensor, int* indices) {
     size_t offset = 0;
     for (int i = 0; i < tensor->ndim; i++) {
@@ -178,8 +224,18 @@ int main() {
     }
     print_tensor(d);
 
+    Tensor* e = create_tensor((float[]){1,2,3,4,5,6}, (int[]){2,3}, 2);
+    Tensor* f = create_tensor((float[]){1,2,3,4,5,6}, (int[]){3,2}, 2);
+    Tensor* g = matmul(e, f);
+    if (!g) { printf("matmul returned NULL\n"); return 1; }
+    printf("ndim=%d shape=[%d,%d] size=%zu\n", g->ndim, g->shape[0], g->shape[1], g->size);
+    print_tensor(g);
+
     free_tensor(a);
     free_tensor(b);
     free_tensor(c);
+    free_tensor(e);
+    free_tensor(f);
+    free_tensor(g);
     return EXIT_SUCCESS;
 }
