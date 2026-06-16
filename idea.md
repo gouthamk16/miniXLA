@@ -67,6 +67,9 @@ typedef struct {
 
 **Deliverables:** Tensor creation API, memory management, CPU kernels, unit tests.
 
+**Could do later:**
+- Softmax over a user-specified axis (currently hardcoded to the last axis, which covers the common logits/attention case). Non-last axes need stride-based gather since the reduced elements aren't contiguous.
+
 ---
 
 ### Phase 2 — Computational Graph

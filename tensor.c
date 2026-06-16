@@ -2,18 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-typedef struct {
-    float* data;
-    int* shape;
-    size_t* strides;
-    int ndim;
-    size_t size;
-} Tensor;
-
-void free_tensor(Tensor* tensor);
-size_t tensor_offset(Tensor* tensor, int* indices);
-void print_tensor(const Tensor* tensor);
+#include <math.h>
+#include "tensor.h"
 
 Tensor* create_tensor(float* data, int* shape, int ndim) {
     if (ndim <= 0) {
@@ -142,6 +132,82 @@ Tensor* matmul(const Tensor* a, const Tensor* b) {
     return result;
 }
 
+// Reorder axes by `order` (a permutation of 0..ndim-1), Output axis d maps to input axis order[d].
+Tensor* permute(const Tensor* x, const int* order) {
+    char* seen = (char*)calloc(x->ndim, 1);
+    if (!seen) return NULL;
+    for (int d = 0; d < x->ndim; d++) {
+        if (order[d] < 0 || order[d] >= x->ndim || seen[order[d]]) {
+            fprintf(stderr, "permute: order is not a valid permutation\n");
+            free(seen);
+            return NULL;
+        }
+        seen[order[d]] = 1;
+    }
+    free(seen);
+
+    int* out_shape = (int*)malloc(x->ndim * sizeof(int));
+    if (!out_shape) return NULL;
+    for (int d = 0; d < x->ndim; d++) out_shape[d] = x->shape[order[d]];
+    Tensor* result = create_tensor(NULL, out_shape, x->ndim);
+    free(out_shape);
+    if (!result) return NULL;
+
+    int* idx = (int*)calloc(x->ndim, sizeof(int)); // current output multi-index
+    if (!idx) { free_tensor(result); return NULL; }
+    for (size_t n = 0; n < result->size; n++) {
+        size_t src = 0;
+        for (int d = 0; d < x->ndim; d++) src += idx[d] * x->strides[order[d]];
+        result->data[n] = x->data[src];
+        for (int d = x->ndim - 1; d >= 0; d--) {     
+            if (++idx[d] < result->shape[d]) break;
+            idx[d] = 0;
+        }
+    }
+    free(idx);
+    return result;
+}
+
+// Transpose: swap the last two axes
+Tensor* transpose(const Tensor* x) {
+    if (x->ndim < 2) {
+        fprintf(stderr, "transpose: need rank >= 2\n");
+        return NULL;
+    }
+    int* order = (int*)malloc(x->ndim * sizeof(int));
+    if (!order) return NULL;
+    for (int d = 0; d < x->ndim; d++) order[d] = d;
+    order[x->ndim - 2] = x->ndim - 1;
+    order[x->ndim - 1] = x->ndim - 2;
+    Tensor* result = permute(x, order);
+    free(order);
+    return result;
+}
+
+// Softmax over the last axis.
+Tensor* softmax(const Tensor* x) {
+    Tensor* result = create_tensor(NULL, x->shape, x->ndim);
+    if (!result) return NULL;
+
+    int axis = x->shape[x->ndim - 1];
+    size_t rows = x->size / (size_t)axis;
+    for (size_t r = 0; r < rows; r++) {
+        const float* in = x->data + r * axis;
+        float* out = result->data + r * axis;
+
+        float max = in[0];
+        for (int j = 1; j < axis; j++) if (in[j] > max) max = in[j];
+
+        float sum = 0;
+        for (int j = 0; j < axis; j++) {
+            out[j] = expf(in[j] - max);
+            sum += out[j];
+        }
+        for (int j = 0; j < axis; j++) out[j] /= sum;
+    }
+    return result;
+}
+
 size_t tensor_offset(Tensor* tensor, int* indices) {
     size_t offset = 0;
     for (int i = 0; i < tensor->ndim; i++) {
@@ -184,58 +250,9 @@ void print_tensor(const Tensor* tensor) {
 }
 
 void free_tensor(Tensor* tensor) {
+    if (!tensor) return;
     free(tensor->data);
     free(tensor->shape);
     free(tensor->strides);
     free(tensor);
-}
-
-int main() {
-    int shape[2] = {2, 3};
-    int ndim = 2;
-    float data_a[6] = {1, 2, 3, 4, 5, 6};
-    float data_b[6] = {6, 5, 4, 3, 2, 1};
-
-    Tensor* a = create_tensor(data_a, shape, ndim);
-    Tensor* b = create_tensor(data_b, shape, ndim);
-    if (!a || !b) {
-        fprintf(stderr, "Failed to create tensors\n");
-        return EXIT_FAILURE;
-    }
-
-    print_tensor(a);
-    printf("\n");
-    print_tensor(b);
-    printf("\n");
-
-    Tensor* c = tensor_add(a, b);
-    if (!c) {
-        fprintf(stderr, "Failed to add tensors\n");
-        return EXIT_FAILURE;
-    }
-
-    print_tensor(c);
-    printf("\n");
-
-    Tensor* d = relu(create_tensor((float[]){-1, 0, 1, -2, 2, -3}, shape, ndim));
-    if (!d) {
-        fprintf(stderr, "Failed to apply ReLU\n");
-        return EXIT_FAILURE;
-    }
-    print_tensor(d);
-
-    Tensor* e = create_tensor((float[]){1,2,3,4,5,6}, (int[]){2,3}, 2);
-    Tensor* f = create_tensor((float[]){1,2,3,4,5,6}, (int[]){3,2}, 2);
-    Tensor* g = matmul(e, f);
-    if (!g) { printf("matmul returned NULL\n"); return 1; }
-    printf("ndim=%d shape=[%d,%d] size=%zu\n", g->ndim, g->shape[0], g->shape[1], g->size);
-    print_tensor(g);
-
-    free_tensor(a);
-    free_tensor(b);
-    free_tensor(c);
-    free_tensor(e);
-    free_tensor(f);
-    free_tensor(g);
-    return EXIT_SUCCESS;
 }
