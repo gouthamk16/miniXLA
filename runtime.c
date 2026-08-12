@@ -29,6 +29,19 @@ Tensor* gpu_run_fused(const Node* fused, const char* ptx) {
     for (int i = 0; i < fused->n_epilogue; i++)
         if (fused->epilogue[i].op == OP_ADD) n_add++;
 
+    // The PTX epilogue always indexes an OP_ADD operand at the same flat
+    // cell as the output; broadcast (e.g. bias-vector) operands aren't
+    // supported by the emitter yet. Fail loudly rather than silently
+    // reading past a smaller buffer -- see the Phase 7 design doc.
+    for (int i = 0; i < fused->n_epilogue; i++) {
+        if (fused->epilogue[i].op != OP_ADD) continue;
+        Tensor* op = fused->epilogue[i].operand->output;
+        if ((int)op->size != M * N) {
+            fprintf(stderr, "gpu_run_fused: broadcast epilogue operands are not supported on GPU\n");
+            return NULL;
+        }
+    }
+
     CUdevice    dev     = 0;
     CUcontext   ctx     = NULL;
     CUmodule    mod     = NULL;

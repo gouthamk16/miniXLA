@@ -52,14 +52,47 @@ Tensor* create_tensor(float* data, int* shape, int ndim) {
     return tensor;
 }
 
+// True if `b`'s shape is a trailing suffix of `a`'s (the bias-broadcast case:
+// a=[M,N], b=[N]). Rejects anything else, including b->ndim > a->ndim.
+static int is_trailing_suffix(const Tensor* a, const Tensor* b) {
+    if (b->ndim > a->ndim) return 0;
+    for (int i = 0; i < b->ndim; i++)
+        if (b->shape[i] != a->shape[a->ndim - b->ndim + i]) return 0;
+    return 1;
+}
+
 Tensor* tensor_add(const Tensor* a, const Tensor* b) {
+    int same_shape = a->ndim == b->ndim;
+    for (int i = 0; same_shape && i < a->ndim; i++)
+        if (a->shape[i] != b->shape[i]) same_shape = 0;
+
+    if (!same_shape && !is_trailing_suffix(a, b)) {
+        fprintf(stderr, "tensor_add: b's shape must match a, or be a trailing suffix of it\n");
+        return NULL;
+    }
+    Tensor* result = create_tensor(NULL, a->shape, a->ndim);
+    if (!result) {
+        fprintf(stderr, "Failed to create result tensor\n");
+        return NULL;
+    }
+    // Row-major + b matching a's trailing dims means a's data is exactly
+    // b's block repeated a->size/b->size times, so a plain modulo indexes
+    // the right element -- same trick works for the same-shape case since
+    // b->size == a->size there and i % size == i.
+    for (size_t i = 0; i < a->size; i++) {
+        result->data[i] = a->data[i] + b->data[i % b->size];
+    }
+    return result;
+}
+
+Tensor* tensor_mul(const Tensor* a, const Tensor* b) {
     if (a->ndim != b->ndim) {
-        fprintf(stderr, "Tensors must have the same number of dimensions\n");
+        fprintf(stderr, "tensor_mul: tensors must have the same number of dimensions\n");
         return NULL;
     }
     for (int i = 0; i < a->ndim; i++) {
         if (a->shape[i] != b->shape[i]) {
-            fprintf(stderr, "Tensors must have the same shape\n");
+            fprintf(stderr, "tensor_mul: tensors must have the same shape\n");
             return NULL;
         }
     }
@@ -69,7 +102,7 @@ Tensor* tensor_add(const Tensor* a, const Tensor* b) {
         return NULL;
     }
     for (size_t i = 0; i < a->size; i++) {
-        result->data[i] = a->data[i] + b->data[i];
+        result->data[i] = a->data[i] * b->data[i];
     }
     return result;
 }

@@ -290,6 +290,23 @@ Tensor* gpu_execute(Node* root, GpuCtx* g) {
             for (int i = 0; i < nd->n_epilogue; i++)
                 if (nd->epilogue[i].op == OP_ADD) n_add++;
 
+            // Broadcast epilogue operands (e.g. a bias vector) aren't
+            // supported by the PTX emitter yet -- see the Phase 7 design
+            // doc. Fail loudly rather than read past a smaller buffer.
+            // node_dims (not ->output->size) because an operand here can
+            // be a still-device-only OP_FUSED result with no host tensor.
+            for (int i = 0; i < nd->n_epilogue; i++) {
+                if (nd->epilogue[i].op != OP_ADD) continue;
+                int or_, oc;
+                node_dims(nd->epilogue[i].operand, &or_, &oc);
+                if (or_ * oc != M * N) {
+                    fprintf(stderr, "gpu_execute: broadcast epilogue operands are not supported on GPU\n");
+                    ok = 0;
+                    break;
+                }
+            }
+            if (!ok) break;
+
             // Use tuned tile if available, else default
             int tile = tile_for(g, nd);
 

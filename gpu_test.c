@@ -40,6 +40,38 @@ static void test_single_fused(void) {
     printf("test_single_fused PASS\n");
 }
 
+// ---- Test 1b: broadcast-bias fused graph is rejected on GPU, not silently
+// wrong. CPU fusion supports it (see tests.c); the PTX emitter doesn't yet
+// (Phase 7 design doc), so both GPU entry points must fail loudly instead
+// of reading past the smaller bias buffer.
+
+static void test_broadcast_bias_rejected_on_gpu(void) {
+    Tensor* a = create_tensor((float[]){1,2,3,4,5,6}, (int[]){2,3}, 2);
+    Tensor* b = create_tensor((float[]){1,2,3,4,5,6}, (int[]){3,2}, 2);
+    Tensor* bias = create_tensor((float[]){-30,-60}, (int[]){2}, 1);
+
+    Node* root = g_relu(g_add(g_matmul(input_node(a), input_node(b)), input_node(bias)));
+    root = optimize(root);
+    assert(root->op == OP_FUSED);
+    Tensor* cpu_out = execute(root);
+    assert(cpu_out);   // CPU fusion handles the broadcast correctly
+
+    char* ptx = emit_ptx(root);
+    Tensor* via_runtime = gpu_run_fused(root, ptx);
+    free(ptx);
+    assert(via_runtime == NULL);
+
+    GpuCtx* ctx = gpu_ctx_create();
+    assert(ctx);
+    Tensor* via_exec = gpu_execute(root, ctx);
+    assert(via_exec == NULL);
+    gpu_ctx_destroy(ctx);
+
+    free_graph(root);
+    free_tensor(a); free_tensor(b); free_tensor(bias);
+    printf("test_broadcast_bias_rejected_on_gpu PASS\n");
+}
+
 // ---- Test 2: two-layer graph (multi-kernel) via gpu_exec.c ----
 // hidden = relu(x * W1 + b1)
 // output = hidden * W2 + b2
@@ -231,6 +263,7 @@ static void bench_large_matmul(void) {
 
 int main(void) {
     test_single_fused();
+    test_broadcast_bias_rejected_on_gpu();
     test_two_layer();
     test_autotune();
     test_module_cache();

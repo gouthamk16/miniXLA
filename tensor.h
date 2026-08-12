@@ -14,7 +14,10 @@ typedef struct {
 Tensor* create_tensor(float* data, int* shape, int ndim);
 void free_tensor(Tensor* tensor);
 
+// `b` may either exactly match `a`'s shape, or be a trailing suffix of it
+// (e.g. a->shape=[M,N], b->shape=[N]) -- the standard bias-broadcast case.
 Tensor* tensor_add(const Tensor* a, const Tensor* b);
+Tensor* tensor_mul(const Tensor* a, const Tensor* b);
 Tensor* relu(const Tensor* x);
 Tensor* matmul(const Tensor* a, const Tensor* b);
 Tensor* transpose(const Tensor* x);

@@ -53,6 +53,7 @@ Node* fused_node(Node* a, Node* b, EpStep* epilogue, int n_epilogue) {
 
 Node* g_matmul(Node* a, Node* b) { return make_node(OP_MATMUL, (Node*[]){a, b}, 2); }
 Node* g_add(Node* a, Node* b)    { return make_node(OP_ADD,    (Node*[]){a, b}, 2); }
+Node* g_mul(Node* a, Node* b)    { return make_node(OP_MUL,    (Node*[]){a, b}, 2); }
 Node* g_relu(Node* x)            { return make_node(OP_RELU,      (Node*[]){x}, 1); }
 Node* g_softmax(Node* x)         { return make_node(OP_SOFTMAX,   (Node*[]){x}, 1); }
 Node* g_transpose(Node* x)       { return make_node(OP_TRANSPOSE, (Node*[]){x}, 1); }
@@ -96,8 +97,15 @@ static Tensor* eval_fused(Node* node) {
                 for (int k = 0; k < K; k++) x += A[i * K + k] * B[k * N + j];
                 for (int e = 0; e < node->n_epilogue; e++) {
                     EpStep s = node->epilogue[e];
-                    if (s.op == OP_ADD)       x += s.operand->output->data[bt * M * N + i * N + j];
-                    else if (s.op == OP_RELU) x = x > 0 ? x : 0;
+                    if (s.op == OP_ADD) {
+                        // Same broadcast trick as tensor_add: an operand
+                        // smaller than the full [batch,M,N] output (a bias
+                        // vector shaped [N]) repeats via modulo.
+                        Tensor* op = s.operand->output;
+                        x += op->data[(bt * M * N + i * N + j) % op->size];
+                    } else if (s.op == OP_RELU) {
+                        x = x > 0 ? x : 0;
+                    }
                 }
                 C[i * N + j] = x;
             }
@@ -110,6 +118,7 @@ Tensor* eval_op(Node* node, Tensor** in) {
     switch (node->op) {
         case OP_MATMUL:    return matmul(in[0], in[1]);
         case OP_ADD:       return tensor_add(in[0], in[1]);
+        case OP_MUL:       return tensor_mul(in[0], in[1]);
         case OP_RELU:      return relu(in[0]);
         case OP_SOFTMAX:   return softmax(in[0]);
         case OP_TRANSPOSE: return transpose(in[0]);

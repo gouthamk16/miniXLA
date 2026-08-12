@@ -7,6 +7,7 @@ typedef enum {
     OP_INPUT,
     OP_MATMUL,
     OP_ADD,
+    OP_MUL,
     OP_RELU,
     OP_SOFTMAX,
     OP_TRANSPOSE,
@@ -35,6 +36,7 @@ Node* fused_node(Node* a, Node* b, EpStep* epilogue, int n_epilogue);
 
 Node* g_matmul(Node* a, Node* b);
 Node* g_add(Node* a, Node* b);
+Node* g_mul(Node* a, Node* b);
 Node* g_relu(Node* x);
 Node* g_softmax(Node* x);
 Node* g_transpose(Node* x);
