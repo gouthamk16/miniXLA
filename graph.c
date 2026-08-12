@@ -1,6 +1,7 @@
 // Computational graph (DAG) layer over the tensor kernels.
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "graph.h"
 
 static Node* make_node(OpType op, Node** inputs, int n_inputs) {
@@ -22,11 +23,89 @@ Node* input_node(Tensor* t) {
     return n;
 }
 
+Node* const_node(Tensor* t) {
+    Node* n = make_node(OP_INPUT, NULL, 0);
+    if (n) { n->output = t; n->is_const = 1; } // owns_output stays 0: caller owns t
+    return n;
+}
+
+Node* fused_node(Node* a, Node* b, EpStep* epilogue, int n_epilogue) {
+    int n_operands = 0;
+    for (int i = 0; i < n_epilogue; i++) if (epilogue[i].op == OP_ADD) n_operands++;
+
+    int n_in = 2 + n_operands;
+    Node** ins = (Node**)malloc(n_in * sizeof(Node*));
+    if (!ins) return NULL;
+    ins[0] = a; ins[1] = b;
+    int k = 2;
+    for (int i = 0; i < n_epilogue; i++) if (epilogue[i].op == OP_ADD) ins[k++] = epilogue[i].operand;
+
+    Node* n = make_node(OP_FUSED, ins, n_in);
+    free(ins);
+    if (!n) return NULL;
+
+    n->epilogue = (EpStep*)malloc(n_epilogue * sizeof(EpStep));
+    if (!n->epilogue) { free(n->inputs); free(n); return NULL; }
+    memcpy(n->epilogue, epilogue, n_epilogue * sizeof(EpStep));
+    n->n_epilogue = n_epilogue;
+    return n;
+}
+
 Node* g_matmul(Node* a, Node* b) { return make_node(OP_MATMUL, (Node*[]){a, b}, 2); }
 Node* g_add(Node* a, Node* b)    { return make_node(OP_ADD,    (Node*[]){a, b}, 2); }
 Node* g_relu(Node* x)            { return make_node(OP_RELU,      (Node*[]){x}, 1); }
 Node* g_softmax(Node* x)         { return make_node(OP_SOFTMAX,   (Node*[]){x}, 1); }
 Node* g_transpose(Node* x)       { return make_node(OP_TRANSPOSE, (Node*[]){x}, 1); }
+
+// Execute a fused region in one loop per output cell: matmul dot-product, then
+// the element-wise epilogue applied in a register, then a single store. No
+// intermediate tensors are allocated.
+static Tensor* eval_fused(Node* node) {
+    Tensor* a = node->inputs[0]->output;
+    Tensor* b = node->inputs[1]->output;
+    int M = a->shape[a->ndim - 2], K = a->shape[a->ndim - 1], N = b->shape[b->ndim - 1];
+    size_t batch = a->size / ((size_t)M * K);
+
+    int* os = (int*)malloc(a->ndim * sizeof(int));
+    if (!os) return NULL;
+    memcpy(os, a->shape, a->ndim * sizeof(int));
+    os[a->ndim - 1] = N;
+    Tensor* r = create_tensor(NULL, os, a->ndim);
+    free(os);
+    if (!r) return NULL;
+
+    for (size_t bt = 0; bt < batch; bt++) {
+        const float* A = a->data + bt * M * K;
+        const float* B = b->data + bt * K * N;
+        float* C = r->data + bt * M * N;
+        for (int i = 0; i < M; i++) {
+            for (int j = 0; j < N; j++) {
+                float x = 0;
+                for (int k = 0; k < K; k++) x += A[i * K + k] * B[k * N + j];
+                for (int e = 0; e < node->n_epilogue; e++) {
+                    EpStep s = node->epilogue[e];
+                    if (s.op == OP_ADD)       x += s.operand->output->data[bt * M * N + i * N + j];
+                    else if (s.op == OP_RELU) x = x > 0 ? x : 0;
+                }
+                C[i * N + j] = x;
+            }
+        }
+    }
+    return r;
+}
+
+Tensor* eval_op(Node* node, Tensor** in) {
+    switch (node->op) {
+        case OP_MATMUL:    return matmul(in[0], in[1]);
+        case OP_ADD:       return tensor_add(in[0], in[1]);
+        case OP_RELU:      return relu(in[0]);
+        case OP_SOFTMAX:   return softmax(in[0]);
+        case OP_TRANSPOSE: return transpose(in[0]);
+        case OP_FUSED:     return eval_fused(node);
+        case OP_INPUT:     return NULL;   // output was set at creation
+    }
+    return NULL;
+}
 
 Tensor* execute(Node* node) {
     if (!node) return NULL;
@@ -39,15 +118,7 @@ Tensor* execute(Node* node) {
     if (node->n_inputs > 0 && !in) return NULL;
     for (int i = 0; i < node->n_inputs; i++) in[i] = node->inputs[i]->output;
 
-    Tensor* out = NULL;
-    switch (node->op) {
-        case OP_MATMUL:    out = matmul(in[0], in[1]); break;
-        case OP_ADD:       out = tensor_add(in[0], in[1]); break;
-        case OP_RELU:      out = relu(in[0]); break;
-        case OP_SOFTMAX:   out = softmax(in[0]); break;
-        case OP_TRANSPOSE: out = transpose(in[0]); break;
-        case OP_INPUT:     break;   // unreachable: output was set at creation
-    }
+    Tensor* out = eval_op(node, in);
     free(in);
 
     if (!out) { fprintf(stderr, "execute: op %d failed\n", node->op); return NULL; }
@@ -56,53 +127,34 @@ Tensor* execute(Node* node) {
     return out;
 }
 
-// Collect each reachable node once (dedup via the visited flag) into `seen`.
-static void collect(Node* node, Node*** seen, int* count, int* cap) {
-    if (!node || node->visited) return;
-    node->visited = 1;
+// Collect each reachable node once (dedup via the visited flag) into `*out`.
+static void collect_rec(Node* n, Node*** out, int* count, int* cap) {
+    if (!n || n->visited) return;
+    n->visited = 1;
     if (*count == *cap) {
         *cap = *cap ? *cap * 2 : 8;
-        *seen = (Node**)realloc(*seen, *cap * sizeof(Node*));
+        *out = (Node**)realloc(*out, *cap * sizeof(Node*));
     }
-    (*seen)[(*count)++] = node;
-    for (int i = 0; i < node->n_inputs; i++) collect(node->inputs[i], seen, count, cap);
+    (*out)[(*count)++] = n;
+    for (int i = 0; i < n->n_inputs; i++) collect_rec(n->inputs[i], out, count, cap);
+}
+
+int graph_collect(Node* root, Node*** out) {
+    *out = NULL;
+    int count = 0, cap = 0;
+    collect_rec(root, out, &count, &cap);
+    for (int i = 0; i < count; i++) (*out)[i]->visited = 0;
+    return count;
 }
 
 void free_graph(Node* root) {
-    Node** seen = NULL;
-    int count = 0, cap = 0;
-    collect(root, &seen, &count, &cap);
+    Node** seen;
+    int count = graph_collect(root, &seen);
     for (int i = 0; i < count; i++) {
         if (seen[i]->owns_output) free_tensor(seen[i]->output);
         free(seen[i]->inputs);
+        free(seen[i]->epilogue);
         free(seen[i]);
     }
     free(seen);
-}
-
-int main(void) {
-    // Build the idea.md example: relu(matmul(a, b) + c), with b shaped so the
-    // matmul is valid: a[2,3] @ b[3,2] = [2,2], then + c[2,2], then relu.
-    Tensor* a = create_tensor((float[]){1, 2, 3, 4, 5, 6}, (int[]){2, 3}, 2);
-    Tensor* b = create_tensor((float[]){1, 2, 3, 4, 5, 6}, (int[]){3, 2}, 2);
-    Tensor* c = create_tensor((float[]){-100, 0, 0, -100}, (int[]){2, 2}, 2);
-
-    Node* na = input_node(a);
-    Node* nb = input_node(b);
-    Node* nc = input_node(c);
-    Node* n1 = g_matmul(na, nb); // [[22,28],[49,64]]
-    Node* n2 = g_add(n1, nc); // [[-78,28],[49,-36]]
-    Node* n3 = g_relu(n2); // [[0,28],[49,0]]
-
-    Tensor* result = execute(n3);
-    if (!result) { fprintf(stderr, "graph execution failed\n"); return EXIT_FAILURE; }
-
-    printf("relu(matmul(a,b) + c) (expect [[0,28],[49,0]]):\n");
-    print_tensor(result);
-
-    free_graph(n3);
-    free_tensor(a);
-    free_tensor(b);
-    free_tensor(c);
-    return EXIT_SUCCESS;
 }
