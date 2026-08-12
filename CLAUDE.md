@@ -43,11 +43,31 @@ live under `docs/superpowers/`.
   `test_constant_folding_chain` regression test).
 - `OP_FUSED` epilogue operands must also appear in `inputs[]` — that's what
   keeps `graph_collect`/`free_graph`/dependency traversal correct without a
-  separate bookkeeping structure.
+  separate bookkeeping structure. Anywhere a node gets replaced (`optimizer.c`'s
+  `replace`), both `inputs[]` *and* `epilogue[].operand` must be repointed —
+  a real dangling-pointer bug shipped from only doing the first (see the
+  `test_fusion_diamond_epilogue` regression test).
+- Two traversal orders exist for a reason — don't collapse them. `graph_collect`
+  (preorder) is for plain reachability/collection. `graph_topo_order`
+  (postorder: every node after its own inputs) is for anything that executes
+  or accumulates in dependency order — `gpu_execute`'s kernel scheduling and
+  `autodiff.c`'s backward pass (which walks it in reverse) both require this.
+  Reversing `graph_collect`'s output is **not** a valid topological order for
+  a DAG with a shared node, only for a tree/chain — that exact bug shipped
+  once (see the `test_diamond_shared_input` / `test_deep_chain` regression
+  tests).
 - The PTX emitter (`ptx.c`) and both GPU runtimes (`runtime.c`, `gpu_exec.c`)
-  are 2-D-only by design (no batch dimension in the kernel). The CPU path
-  (`tensor.c`, `graph.c`) does support batched matmul; don't assume GPU and
-  CPU code paths share that constraint.
+  are 2-D-only by design (no batch dimension in the kernel) and assume every
+  `OP_ADD` epilogue operand is full-size (`M*N`) — broadcast bias-add
+  (`tensor_add`'s trailing-suffix case) is CPU-only; both GPU runtimes detect
+  a broadcast-shaped operand and fail loudly rather than compute silently
+  wrong output. The CPU path (`tensor.c`, `graph.c`) does support batched
+  matmul; don't assume GPU and CPU code paths share either constraint.
+- `autodiff.c`'s `backward()` is CPU-only and expects the *unoptimized*
+  graph — call it before `optimize()`, not after. It computes gradient
+  Tensors directly rather than building a second differentiable graph (see
+  the Phase 6 design doc for why); don't add graph-node VJP rules expecting
+  `backward` output to be itself differentiable.
 
 ## Build & test
 
