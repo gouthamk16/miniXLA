@@ -72,6 +72,59 @@ static void test_broadcast_bias_rejected_on_gpu(void) {
     printf("test_broadcast_bias_rejected_on_gpu PASS\n");
 }
 
+// ---- Test 1c: diamond-shaped graph (a shared leaf feeding two independent
+// fused branches that a third fused node then combines) via gpu_exec.c.
+// gpu_execute used to derive its execution order by reversing
+// graph_collect's preorder, which is only a valid topological order for a
+// tree/chain -- for a real DAG like this one, the shared leaf `x` could be
+// scheduled after a node that needs it already uploaded. See the Phase 7
+// design doc / graph_topo_order in graph.c.
+
+static void test_diamond_shared_input(void) {
+    int M = 2, K = 2, N = 2;
+    float* xd  = calloc(M * K, sizeof(float));
+    float* w1d = calloc(K * N, sizeof(float));
+    float* w2d = calloc(K * N, sizeof(float));
+    float* w3d = calloc(N * N, sizeof(float));
+    for (int i = 0; i < M * K; i++) xd[i]  = (float)(i % 5) * 0.1f + 0.1f;
+    for (int i = 0; i < K * N; i++) w1d[i] = (float)(i % 3) * 0.2f - 0.1f;
+    for (int i = 0; i < K * N; i++) w2d[i] = (float)(i % 4) * 0.15f + 0.05f;
+    for (int i = 0; i < N * N; i++) w3d[i] = (float)(i % 3) * 0.1f;
+
+    Tensor* tx  = create_tensor(xd,  (int[]){M, K}, 2);
+    Tensor* tw1 = create_tensor(w1d, (int[]){K, N}, 2);
+    Tensor* tw2 = create_tensor(w2d, (int[]){K, N}, 2);
+    Tensor* tw3 = create_tensor(w3d, (int[]){N, N}, 2);
+
+    Node* nx  = input_node(tx);
+    Node* nw1 = input_node(tw1);
+    Node* nw2 = input_node(tw2);
+    Node* nw3 = input_node(tw3);
+
+    // h1 and h2 both read `nx` directly -- the diamond.
+    Node* h1  = g_relu(g_matmul(nx, nw1));
+    Node* h2  = g_relu(g_matmul(nx, nw2));
+    Node* root = optimize(g_add(g_matmul(h1, nw3), h2));
+    assert(root->op == OP_FUSED);
+
+    Tensor* cpu_out = execute(root);
+    assert(cpu_out);
+
+    GpuCtx* ctx = gpu_ctx_create();
+    assert(ctx);
+    Tensor* gpu_out = gpu_execute(root, ctx);
+    gpu_ctx_destroy(ctx);
+
+    assert(gpu_out);
+    assert(approx_tensors(cpu_out, gpu_out, 1e-3f));
+
+    free_tensor(gpu_out);
+    free_graph(root);
+    free_tensor(tx); free_tensor(tw1); free_tensor(tw2); free_tensor(tw3);
+    free(xd); free(w1d); free(w2d); free(w3d);
+    printf("test_diamond_shared_input PASS\n");
+}
+
 // ---- Test 2: two-layer graph (multi-kernel) via gpu_exec.c ----
 // hidden = relu(x * W1 + b1)
 // output = hidden * W2 + b2
@@ -132,6 +185,67 @@ static void test_two_layer(void) {
     free_tensor(tw2); free_tensor(tb2);
     free(xd); free(w1d); free(b1d); free(w2d); free(b2d);
     printf("test_two_layer PASS\n");
+}
+
+// ---- Test 2b: deep chain (8 fused layers) — stresses last-use buffer
+// freeing over more hops than the 2-layer/diamond tests (more chances for
+// an off-by-one in last_use to corrupt a result), and confirms device
+// memory returns to baseline once gpu_execute returns. Note this does NOT
+// prove peak usage during the run is lower than the old always-free-at-
+// the-end behavior -- cuMemGetInfo here only samples before/after the
+// whole call, not mid-run. That peak-memory difference is what the
+// benchmark suite measures with sampling across the run instead.
+
+#define DEEP_CHAIN_LAYERS 8
+
+static void test_deep_chain(void) {
+    const int LAYERS = DEEP_CHAIN_LAYERS, S = 256;
+    Tensor* tensors[DEEP_CHAIN_LAYERS];
+    Node*   weights[DEEP_CHAIN_LAYERS];
+
+    float* xd = malloc((size_t)S * S * sizeof(float));
+    for (int i = 0; i < S * S; i++) xd[i] = (float)(i % 13) * 0.01f - 0.06f;
+    Tensor* tx = create_tensor(xd, (int[]){S, S}, 2);
+    free(xd);
+    Node* nx = input_node(tx);
+
+    Node* h = nx;
+    for (int l = 0; l < LAYERS; l++) {
+        float* wd = malloc((size_t)S * S * sizeof(float));
+        for (int i = 0; i < S * S; i++) wd[i] = (float)((i + l) % 11) * 0.01f - 0.05f;
+        tensors[l] = create_tensor(wd, (int[]){S, S}, 2);
+        free(wd);
+        weights[l] = input_node(tensors[l]);
+        h = g_relu(g_matmul(h, weights[l]));
+    }
+
+    Node* root = optimize(h);
+    assert(root->op == OP_FUSED);
+    Tensor* cpu_out = execute(root);
+    assert(cpu_out);
+
+    GpuCtx* ctx = gpu_ctx_create();
+    assert(ctx);
+
+    size_t free_before, free_after, total;
+    cuMemGetInfo(&free_before, &total);
+    Tensor* gpu_out = gpu_execute(root, ctx);
+    cuMemGetInfo(&free_after, &total);
+
+    assert(gpu_out);
+    assert(approx_tensors(cpu_out, gpu_out, 5e-2f));  // fp32 drift over 8 chained matmuls
+
+    // Baseline should be restored -- everything gpu_execute allocated for
+    // this call is freed by the time it returns, whether freed eagerly
+    // (last-use) or all at the end.
+    assert(free_after >= free_before - (16 * 1024 * 1024));  // small CUDA-internal slack
+
+    free_tensor(gpu_out);
+    gpu_ctx_destroy(ctx);
+    free_graph(root);
+    free_tensor(tx);
+    for (int l = 0; l < LAYERS; l++) free_tensor(tensors[l]);
+    printf("test_deep_chain PASS\n");
 }
 
 // ---- Test 3: autotuner — picks best tile, subsequent execute uses it ----
@@ -264,7 +378,9 @@ static void bench_large_matmul(void) {
 int main(void) {
     test_single_fused();
     test_broadcast_bias_rejected_on_gpu();
+    test_diamond_shared_input();
     test_two_layer();
+    test_deep_chain();
     test_autotune();
     test_module_cache();
     bench_large_matmul();

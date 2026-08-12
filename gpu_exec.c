@@ -24,6 +24,13 @@ static CUdeviceptr map_get(const DevMap* m, const Node* n) {
     return 0;
 }
 
+// Marks a buffer as already freed so the end-of-execute cleanup pass (which
+// frees every non-zero pointer still in the map) doesn't double-free it.
+static void map_clear(DevMap* m, const Node* n) {
+    for (int i = 0; i < m->count; i++)
+        if (m->data[i].node == n) { m->data[i].ptr = 0; return; }
+}
+
 // ---- Module cache (PTX string → CUmodule) ----
 // Different tile sizes produce different PTX strings so the cache key is the
 // full PTX; no extra discriminator needed.
@@ -258,12 +265,33 @@ at_cleanup:
 
 // ---- gpu_execute ----
 
+static int node_index(Node** nodes, int n, const Node* target) {
+    for (int i = 0; i < n; i++) if (nodes[i] == target) return i;
+    return -1;
+}
+
 Tensor* gpu_execute(Node* root, GpuCtx* g) {
+    // graph_topo_order (not graph_collect reversed -- that's only a valid
+    // execution order for a tree/chain, not a DAG with a shared node; see
+    // the Phase 7 design doc) so every node's inputs are already uploaded
+    // or computed by the time the loop reaches it.
     Node** nodes;
-    int n = graph_collect(root, &nodes);
-    // Reverse pre-order → topological order (leaves first)
-    for (int i = 0, j = n-1; i < j; i++, j--) {
-        Node* t = nodes[i]; nodes[i] = nodes[j]; nodes[j] = t;
+    int n = graph_topo_order(root, &nodes);
+
+    // last_use[k] = highest index in `nodes` of a node that consumes
+    // nodes[k], or -1 if nothing in this graph does (true only for `root`
+    // itself, by construction of graph_collect -- every other node here is
+    // reachable *because* something consumes it). Lets the execution loop
+    // free an intermediate's device buffer right after its last consumer
+    // runs instead of holding every buffer alive until the whole graph is
+    // done -- see the Phase 7 design doc.
+    int* last_use = (int*)malloc(n * sizeof(int));
+    for (int k = 0; k < n; k++) last_use[k] = -1;
+    for (int j = 0; j < n; j++) {
+        for (int a = 0; a < nodes[j]->n_inputs; a++) {
+            int k = node_index(nodes, n, nodes[j]->inputs[a]);
+            if (k >= 0 && j > last_use[k]) last_use[k] = j;
+        }
     }
 
     DevMap  map  = {0};
@@ -345,7 +373,18 @@ Tensor* gpu_execute(Node* root, GpuCtx* g) {
             fprintf(stderr, "gpu_execute: op %d not OP_INPUT/OP_FUSED; call optimize() first\n", nd->op);
             ok = 0;
         }
+
+        if (ok) {
+            for (int a = 0; a < nd->n_inputs; a++) {
+                int k = node_index(nodes, n, nd->inputs[a]);
+                if (k >= 0 && last_use[k] == ni) {
+                    CUdeviceptr p = map_get(&map, nodes[k]);
+                    if (p) { cuMemFree(p); map_clear(&map, nodes[k]); }
+                }
+            }
+        }
     }
+    free(last_use);
 
     if (ok) ok = cu_check(cuCtxSynchronize(), "cuCtxSynchronize");
 

@@ -3,12 +3,22 @@
 #include "optimizer.h"
 
 // Repoint every input pointer equal to `old` to `repl` across the graph.
+// Also repoints `epilogue[].operand` -- a redundant reference to the same
+// node an OP_FUSED input already holds (see the invariant in graph.h). If
+// `old` is itself an epilogue operand that a later fusion pass then folds
+// into something else, leaving that copy stale would dangle once `old` is
+// freed as an orphan: the fused node's inputs[] would correctly point to
+// the replacement, but eval_fused's epilogue walk would still deref the
+// freed node.
 static void replace(Node* root, Node* old, Node* repl) {
     Node** nodes;
     int n = graph_collect(root, &nodes);
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
         for (int j = 0; j < nodes[i]->n_inputs; j++)
             if (nodes[i]->inputs[j] == old) nodes[i]->inputs[j] = repl;
+        for (int j = 0; j < nodes[i]->n_epilogue; j++)
+            if (nodes[i]->epilogue[j].operand == old) nodes[i]->epilogue[j].operand = repl;
+    }
     free(nodes);
 }
 

@@ -168,6 +168,27 @@ int graph_collect(Node* root, Node*** out) {
     return count;
 }
 
+// Postorder: recurse into inputs, then emit self -- so a node is only
+// emitted after every one of its own dependencies already has been.
+static void topo_rec(Node* n, Node*** out, int* count, int* cap) {
+    if (!n || n->visited) return;
+    n->visited = 1;
+    for (int i = 0; i < n->n_inputs; i++) topo_rec(n->inputs[i], out, count, cap);
+    if (*count == *cap) {
+        *cap = *cap ? *cap * 2 : 8;
+        *out = (Node**)realloc(*out, *cap * sizeof(Node*));
+    }
+    (*out)[(*count)++] = n;
+}
+
+int graph_topo_order(Node* root, Node*** out) {
+    *out = NULL;
+    int count = 0, cap = 0;
+    topo_rec(root, out, &count, &cap);
+    for (int i = 0; i < count; i++) (*out)[i]->visited = 0;
+    return count;
+}
+
 void free_graph(Node* root) {
     Node** seen;
     int count = graph_collect(root, &seen);

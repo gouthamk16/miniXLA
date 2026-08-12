@@ -188,6 +188,37 @@ static void test_fusion(void) {
     printf("test_fusion PASS\n");
 }
 
+static void test_fusion_diamond_epilogue(void) {
+    // Diamond: h1 and h2 both read nx, and h2 is used as an *epilogue ADD
+    // operand* of the node that h1 anchors. Fusing h1's chain first turns
+    // h2 into an epilogue operand; fusing h2's own chain in a later
+    // fixpoint round then replaces h2 itself with its fused form. Regression
+    // for a dangling epilogue->operand pointer: replace() used to repoint
+    // inputs[] but not the redundant epilogue[].operand copy, so the
+    // now-fused node kept reading a freed h2 node during eval_fused.
+    Tensor* x  = create_tensor((float[]){1,2,3,4}, (int[]){2,2}, 2);
+    Tensor* w1 = create_tensor((float[]){1,0,0,1}, (int[]){2,2}, 2);
+    Tensor* w2 = create_tensor((float[]){0,1,1,0}, (int[]){2,2}, 2);
+    Tensor* w3 = create_tensor((float[]){1,1,1,1}, (int[]){2,2}, 2);
+
+    Node* nx = input_node(x), * nw1 = input_node(w1), * nw2 = input_node(w2), * nw3 = input_node(w3);
+    Node* h1 = g_relu(g_matmul(nx, nw1));
+    Node* h2 = g_relu(g_matmul(nx, nw2));
+    Node* root = optimize(g_add(g_matmul(h1, nw3), h2));
+    assert(root->op == OP_FUSED);
+
+    Tensor* got = execute(root);
+    assert(got);
+    // h1 = relu(x@w1) = relu(x) = [[1,2],[3,4]] (w1 = identity)
+    // h2 = relu(x@w2) = relu(x with cols swapped) = [[2,1],[4,3]] (w2 swaps cols)
+    // h1@w3 = [[3,3],[7,7]] (w3 = all-ones); + h2 = [[5,4],[11,10]]
+    assert(approx(got, (float[]){5, 4, 11, 10}));
+
+    free_graph(root);
+    free_tensor(x); free_tensor(w1); free_tensor(w2); free_tensor(w3);
+    printf("test_fusion_diamond_epilogue PASS\n");
+}
+
 static void test_dce_after_fusion(void) {
     Tensor* a = create_tensor((float[]){1, 2, 3, 4, 5, 6}, (int[]){2, 3}, 2);
     Tensor* b = create_tensor((float[]){1, 2, 3, 4, 5, 6}, (int[]){3, 2}, 2);
@@ -408,6 +439,7 @@ int main(void) {
     test_constant_folding();
     test_constant_folding_chain();
     test_fusion();
+    test_fusion_diamond_epilogue();
     test_dce_after_fusion();
     test_ptx_codegen();
     test_grad_matmul();

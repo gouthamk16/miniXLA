@@ -51,6 +51,16 @@ Tensor* execute(Node* node);
 // *out). Returns the count. Resets each node's visited flag before returning.
 int graph_collect(Node* root, Node*** out);
 
+// Topological order of every node reachable from `root`: each node appears
+// only after all of its own inputs -- a valid execution/dependency order.
+// NOT the same as reversing graph_collect's preorder, which only happens to
+// be valid for a tree/chain; a node with two consumers can be discovered
+// through one before the other is even visited. Reverse this result for a
+// reverse-mode traversal (e.g. backprop), where a node instead needs to come
+// after all of its *consumers*. Same caller-frees/visited-reset contract as
+// graph_collect.
+int graph_topo_order(Node* root, Node*** out);
+
 void free_graph(Node* root);
 
 #endif

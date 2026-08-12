@@ -6,32 +6,6 @@
 #include <string.h>
 #include "autodiff.h"
 
-// Postorder DFS (inputs before self) -- the reverse of graph_collect's
-// preorder. Reversing this list gives every node after all of its
-// consumers, which is exactly the order backward propagation needs: a
-// node's gradient must be fully accumulated before it pushes gradient to
-// its own inputs. graph_collect's preorder can't guarantee that for a DAG
-// (a shared node can be reached via one consumer before a second consumer
-// is even visited).
-static void topo_rec(Node* n, Node*** out, int* count, int* cap) {
-    if (!n || n->visited) return;
-    n->visited = 1;
-    for (int i = 0; i < n->n_inputs; i++) topo_rec(n->inputs[i], out, count, cap);
-    if (*count == *cap) {
-        *cap = *cap ? *cap * 2 : 8;
-        *out = (Node**)realloc(*out, *cap * sizeof(Node*));
-    }
-    (*out)[(*count)++] = n;
-}
-
-static int topo_order(Node* root, Node*** out) {
-    *out = NULL;
-    int count = 0, cap = 0;
-    topo_rec(root, out, &count, &cap);
-    for (int i = 0; i < count; i++) (*out)[i]->visited = 0;
-    return count;
-}
-
 // Add `contrib` into node `n`'s accumulated gradient, creating the entry on
 // first contribution. Takes ownership of `contrib`.
 static void tape_accumulate(GradTape* tape, const Node* n, Tensor* contrib) {
@@ -101,8 +75,12 @@ GradTape backward(Node* output) {
         return tape;
     }
 
+    // graph_topo_order puts every node after its own inputs; walking it in
+    // reverse instead puts every node after all of its *consumers* -- what
+    // backward propagation needs, since a node's gradient must be fully
+    // accumulated before it pushes gradient further to its own inputs.
     Node** order;
-    int n = topo_order(output, &order);
+    int n = graph_topo_order(output, &order);
 
     tape_accumulate(&tape, output, ones_like(output->output));
 
