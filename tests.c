@@ -89,6 +89,27 @@ static void test_constant_folding(void) {
     printf("test_constant_folding PASS\n");
 }
 
+static void test_constant_folding_chain(void) {
+    // Two-level constant chain: add(matmul(const_a, const_b), const_c). The
+    // matmul folds first, then the add folds the result with const_c. Also
+    // exercises that the optimizer frees the intermediate const the first
+    // fold produces once the second fold subsumes it.
+    Tensor* a = create_tensor((float[]){1, 2, 3, 4, 5, 6}, (int[]){2, 3}, 2);
+    Tensor* b = create_tensor((float[]){1, 2, 3, 4, 5, 6}, (int[]){3, 2}, 2);
+    Tensor* c = create_tensor((float[]){1, 1, 1, 1}, (int[]){2, 2}, 2);
+    Node* m = g_matmul(const_node(a), const_node(b));
+    Node* root = optimize(g_add(m, const_node(c)));
+
+    assert(root->op == OP_INPUT && root->is_const == 1);
+    assert(approx(root->output, (float[]){23, 29, 50, 65}));
+
+    free_graph(root);
+    free_tensor(a);
+    free_tensor(b);
+    free_tensor(c);
+    printf("test_constant_folding_chain PASS\n");
+}
+
 static int count_nodes(Node* root) {
     Node** nodes;
     int n = graph_collect(root, &nodes);
@@ -168,6 +189,7 @@ int main(void) {
     test_fused_exec();
     test_redundant_removal();
     test_constant_folding();
+    test_constant_folding_chain();
     test_fusion();
     test_dce_after_fusion();
     test_ptx_codegen();

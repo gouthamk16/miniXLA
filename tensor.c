@@ -87,19 +87,29 @@ Tensor* relu(const Tensor* x) {
 }
 
 Tensor* matmul(const Tensor* a, const Tensor* b) {
-    // Multupliying batch dimensions in parallel?
+    if (a->ndim < 2 || b->ndim < 2 || a->ndim != b->ndim) {
+        fprintf(stderr, "matmul: both operands need rank >= 2 and matching rank\n");
+        return NULL;
+    }
+
     int M = a->shape[a->ndim-2];
     int K = a->shape[a->ndim-1];
     int N = b->shape[b->ndim-1];
 
-    if (a->ndim != b->ndim || b->shape[b->ndim-2] != K) {
+    if (b->shape[b->ndim-2] != K) {
         fprintf(stderr, "Incompatible shapes for matmul: [%d,%d] x [%d,%d]\n",
-                a->shape[a->ndim-2], a->shape[a->ndim-1],
-                b->shape[b->ndim-2], b->shape[b->ndim-1]);
+                M, K, b->shape[b->ndim-2], N);
         return NULL;
     }
+    for (int i = 0; i < a->ndim - 2; i++) {
+        if (a->shape[i] != b->shape[i]) {
+            fprintf(stderr, "matmul: batch dimension %d mismatch (%d vs %d)\n",
+                    i, a->shape[i], b->shape[i]);
+            return NULL;
+        }
+    }
 
-    size_t batch_size = a->size / (a->shape[a->ndim-2] * a->shape[a->ndim-1]);
+    size_t batch_size = a->size / ((size_t)M * K);
 
     int* out_shape = (int*)malloc(a->ndim * sizeof(int));
     if (!out_shape) {

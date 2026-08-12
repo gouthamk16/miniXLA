@@ -63,6 +63,18 @@ Node* g_transpose(Node* x)       { return make_node(OP_TRANSPOSE, (Node*[]){x}, 
 static Tensor* eval_fused(Node* node) {
     Tensor* a = node->inputs[0]->output;
     Tensor* b = node->inputs[1]->output;
+    if (a->ndim < 2 || b->ndim < 2 || a->ndim != b->ndim ||
+        a->shape[a->ndim - 1] != b->shape[b->ndim - 2]) {
+        fprintf(stderr, "eval_fused: incompatible matmul operand shapes\n");
+        return NULL;
+    }
+    for (int i = 0; i < a->ndim - 2; i++) {
+        if (a->shape[i] != b->shape[i]) {
+            fprintf(stderr, "eval_fused: batch dimension %d mismatch\n", i);
+            return NULL;
+        }
+    }
+
     int M = a->shape[a->ndim - 2], K = a->shape[a->ndim - 1], N = b->shape[b->ndim - 1];
     size_t batch = a->size / ((size_t)M * K);
 

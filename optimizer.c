@@ -121,38 +121,46 @@ static int operator_fusion(Node** root) {
     return changed;
 }
 
-// Free every node that was reachable before optimizing but is now orphaned.
-// Orphans are exactly `before` minus the live set.
-static void dead_node_elimination(Node* root, Node** before, int n_before) {
-    Node** live;
-    int n_live = graph_collect(root, &live);
-    for (int i = 0; i < n_before; i++) {
-        Node* b = before[i];
-        int alive = 0;
-        for (int j = 0; j < n_live; j++) if (live[j] == b) { alive = 1; break; }
-        if (!alive) {
-            if (b->owns_output) free_tensor(b->output);
-            free(b->inputs);
-            free(b->epilogue);
-            free(b);
+typedef int (*Pass)(Node**);
+
+// Run one pass; if it changed the graph, free every node that was reachable
+// immediately before the pass ran but isn't anymore. Snapshotting right
+// before each call (rather than once at the start of optimize) is what makes
+// this catch nodes the optimizer itself created and later superseded — e.g.
+// a const folded from a matmul that a later fold then absorbs into a bigger
+// const. A single start-of-optimize snapshot would never see that node.
+static int run_pass(Node** root, Pass pass) {
+    Node** before;
+    int n_before = graph_collect(*root, &before);
+
+    int changed = pass(root);
+    if (changed) {
+        Node** live;
+        int n_live = graph_collect(*root, &live);
+        for (int i = 0; i < n_before; i++) {
+            Node* b = before[i];
+            int alive = 0;
+            for (int j = 0; j < n_live; j++) if (live[j] == b) { alive = 1; break; }
+            if (!alive) {
+                if (b->owns_output) free_tensor(b->output);
+                free(b->inputs);
+                free(b->epilogue);
+                free(b);
+            }
         }
+        free(live);
     }
-    free(live);
+    free(before);
+    return changed;
 }
 
 Node* optimize(Node* root) {
-    Node** before;
-    int n_before = graph_collect(root, &before);
-
     int changed;
     do {
         changed = 0;
-        changed |= redundant_op_removal(&root);
-        changed |= constant_folding(&root);
-        changed |= operator_fusion(&root);
+        changed |= run_pass(&root, redundant_op_removal);
+        changed |= run_pass(&root, constant_folding);
+        changed |= run_pass(&root, operator_fusion);
     } while (changed);
-
-    dead_node_elimination(root, before, n_before);
-    free(before);
     return root;
 }
