@@ -136,6 +136,192 @@ static CUresult launch_fused(CUfunction fn, int M, int N, int K,
     return r;
 }
 
+// ---- Tensor-core path (additive; see ptx.h/TC_* and emit_ptx_tensorcore) ----
+
+static CUresult launch_fused_tc(CUfunction fn, int M, int N, int K,
+                                 CUdeviceptr d_a, CUdeviceptr d_b,
+                                 CUdeviceptr* op_ptrs, int n_add,
+                                 CUdeviceptr d_out) {
+    unsigned uM = M, uN = N, uK = K;
+    void** params = malloc((n_add + 6) * sizeof(void*));
+    if (!params) return CUDA_ERROR_OUT_OF_MEMORY;
+    CUdeviceptr* op_copy = n_add ? malloc(n_add * sizeof(CUdeviceptr)) : NULL;
+    if (n_add && !op_copy) { free(params); return CUDA_ERROR_OUT_OF_MEMORY; }
+    if (op_copy) memcpy(op_copy, op_ptrs, n_add * sizeof(CUdeviceptr));
+
+    int pi = 0;
+    params[pi++] = &d_a;
+    params[pi++] = &d_b;
+    for (int i = 0; i < n_add; i++) params[pi++] = &op_copy[i];
+    params[pi++] = &d_out;
+    params[pi++] = &uM;
+    params[pi++] = &uN;
+    params[pi++] = &uK;
+
+    unsigned gx = ((unsigned)N + TC_BN - 1) / TC_BN;
+    unsigned gy = ((unsigned)M + TC_BM - 1) / TC_BM;
+    CUresult r = cuLaunchKernel(fn, gx, gy, 1, TC_NTHREADS, 1, 1, 0, 0, params, NULL);
+    free(params);
+    free(op_copy);
+    return r;
+}
+
+static CUfunction load_tc_fn(GpuCtx* g, const Node* fused, char** ptx_out, int* ok) {
+    char* ptx = emit_ptx_tensorcore(fused);
+    CUmodule mod = cache_lookup(&g->mod_cache, ptx);
+    CUfunction fn = NULL;
+    if (mod) {
+        free(ptx);
+    } else {
+        if (!cu_check(cuModuleLoadDataEx(&mod, ptx, 0, NULL, NULL), "tc cuModuleLoadDataEx")) {
+            free(ptx);
+            *ok = 0;
+            return NULL;
+        }
+        cache_insert(&g->mod_cache, ptx, mod);
+    }
+    if (!cu_check(cuModuleGetFunction(&fn, mod, "fused"), "tc cuModuleGetFunction")) *ok = 0;
+    return fn;
+}
+
+Tensor* gpu_run_tensorcore(const Node* fused, GpuCtx* g) {
+    Tensor* ta = fused->inputs[0]->output;
+    Tensor* tb = fused->inputs[1]->output;
+    int M = ta->shape[0], K = ta->shape[1], N = tb->shape[1];
+    size_t out_bytes = (size_t)M * N * sizeof(float);
+
+    int n_add = 0;
+    for (int i = 0; i < fused->n_epilogue; i++)
+        if (fused->epilogue[i].op == OP_ADD) n_add++;
+
+    CUdeviceptr d_a = 0, d_b = 0, d_out = 0;
+    CUdeviceptr* d_ops = n_add ? calloc(n_add, sizeof(CUdeviceptr)) : NULL;
+    Tensor* result = NULL;
+    int ok = 1;
+
+    if (!cu_check(cuMemAlloc(&d_a, ta->size * sizeof(float)), "tc alloc a") ||
+        !cu_check(cuMemcpyHtoD(d_a, ta->data, ta->size * sizeof(float)), "tc H2D a") ||
+        !cu_check(cuMemAlloc(&d_b, tb->size * sizeof(float)), "tc alloc b") ||
+        !cu_check(cuMemcpyHtoD(d_b, tb->data, tb->size * sizeof(float)), "tc H2D b") ||
+        !cu_check(cuMemAlloc(&d_out, out_bytes), "tc alloc out"))
+        goto cleanup;
+
+    {
+        int ai = 0;
+        for (int i = 0; i < fused->n_epilogue; i++) {
+            if (fused->epilogue[i].op != OP_ADD) continue;
+            Tensor* op = fused->epilogue[i].operand->output;
+            if ((int)op->size != M * N) {
+                fprintf(stderr, "gpu_run_tensorcore: broadcast epilogue operands are not supported\n");
+                goto cleanup;
+            }
+            if (!cu_check(cuMemAlloc(&d_ops[ai], op->size * sizeof(float)), "tc alloc op") ||
+                !cu_check(cuMemcpyHtoD(d_ops[ai], op->data, op->size * sizeof(float)), "tc H2D op"))
+                goto cleanup;
+            ai++;
+        }
+    }
+
+    {
+        CUfunction fn = load_tc_fn(g, fused, NULL, &ok);
+        if (!ok || !fn) goto cleanup;
+        ok = cu_check(launch_fused_tc(fn, M, N, K, d_a, d_b, d_ops, n_add, d_out), "tc cuLaunchKernel");
+        if (!ok) goto cleanup;
+        ok = cu_check(cuCtxSynchronize(), "tc cuCtxSynchronize");
+        if (!ok) goto cleanup;
+    }
+
+    result = create_tensor(NULL, (int[]){M, N}, 2);
+    if (!result || !cu_check(cuMemcpyDtoH(result->data, d_out, out_bytes), "tc cuMemcpyDtoH")) {
+        free_tensor(result);
+        result = NULL;
+    }
+
+cleanup:
+    if (d_a) cuMemFree(d_a);
+    if (d_b) cuMemFree(d_b);
+    if (d_out) cuMemFree(d_out);
+    if (d_ops) {
+        for (int i = 0; i < n_add; i++) if (d_ops[i]) cuMemFree(d_ops[i]);
+        free(d_ops);
+    }
+    return result;
+}
+
+double gpu_time_kernel_tc_ms(Node* root, GpuCtx* g, int warmup, int reps) {
+    if (root->op != OP_FUSED) return -1.0;
+    if (!root->inputs[0]->output || !root->inputs[1]->output) return -1.0;
+
+    int M, K, N, dummy;
+    node_dims(root->inputs[0], &M, &K);
+    node_dims(root->inputs[1], &dummy, &N);
+
+    int n_add = 0;
+    for (int i = 0; i < root->n_epilogue; i++)
+        if (root->epilogue[i].op == OP_ADD) n_add++;
+
+    Tensor* ta = root->inputs[0]->output;
+    Tensor* tb = root->inputs[1]->output;
+    CUdeviceptr d_a = 0, d_b = 0, d_out = 0;
+    CUdeviceptr* d_ops = n_add ? calloc(n_add, sizeof(CUdeviceptr)) : NULL;
+    double result = -1.0;
+
+    if (!cu_check(cuMemAlloc(&d_a, ta->size * sizeof(float)), "tc time alloc a") ||
+        !cu_check(cuMemcpyHtoD(d_a, ta->data, ta->size * sizeof(float)), "tc time H2D a") ||
+        !cu_check(cuMemAlloc(&d_b, tb->size * sizeof(float)), "tc time alloc b") ||
+        !cu_check(cuMemcpyHtoD(d_b, tb->data, tb->size * sizeof(float)), "tc time H2D b") ||
+        !cu_check(cuMemAlloc(&d_out, (size_t)M * N * sizeof(float)), "tc time alloc out"))
+        goto cleanup;
+
+    {
+        int ai = 0;
+        for (int i = 0; i < root->n_epilogue; i++) {
+            if (root->epilogue[i].op != OP_ADD) continue;
+            Tensor* op = root->epilogue[i].operand->output;
+            if (!cu_check(cuMemAlloc(&d_ops[ai], op->size * sizeof(float)), "tc time alloc op") ||
+                !cu_check(cuMemcpyHtoD(d_ops[ai], op->data, op->size * sizeof(float)), "tc time H2D op"))
+                goto cleanup;
+            ai++;
+        }
+    }
+
+    {
+        int ok = 1;
+        CUfunction fn = load_tc_fn(g, root, NULL, &ok);
+        if (!ok || !fn) goto cleanup;
+
+        for (int w = 0; w < warmup; w++) {
+            launch_fused_tc(fn, M, N, K, d_a, d_b, d_ops, n_add, d_out);
+            cuCtxSynchronize();
+        }
+
+        CUevent t0, t1;
+        cuEventCreate(&t0, CU_EVENT_DEFAULT);
+        cuEventCreate(&t1, CU_EVENT_DEFAULT);
+        double best = 1e30;
+        for (int r = 0; r < reps; r++) {
+            cuEventRecord(t0, 0);
+            launch_fused_tc(fn, M, N, K, d_a, d_b, d_ops, n_add, d_out);
+            cuEventRecord(t1, 0);
+            cuEventSynchronize(t1);
+            float ms; cuEventElapsedTime(&ms, t0, t1);
+            if (ms < best) best = ms;
+        }
+        cuEventDestroy(t0); cuEventDestroy(t1);
+        result = best;
+    }
+
+cleanup:
+    if (d_a) cuMemFree(d_a);
+    if (d_b) cuMemFree(d_b);
+    if (d_out) cuMemFree(d_out);
+    if (d_ops) {
+        for (int i = 0; i < n_add; i++) if (d_ops[i]) cuMemFree(d_ops[i]);
+        free(d_ops);
+    }
+    return result;
+}
+
 // ---- gpu_time_kernel_ms ----
 
 double gpu_time_kernel_ms(Node* root, GpuCtx* g, int warmup, int reps) {

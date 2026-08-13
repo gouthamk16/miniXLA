@@ -30,4 +30,15 @@ Tensor* gpu_execute(Node* root, GpuCtx* ctx);
 // be set. Returns -1.0 on failure.
 double gpu_time_kernel_ms(Node* root, GpuCtx* ctx, int warmup, int reps);
 
+// Same as gpu_execute but for a single OP_FUSED node, run through the TF32
+// tensor-core kernel (docs/research/tensorcore-and-fusion.md) instead of
+// the default register-blocked one. Additive/experimental: everything else
+// in the codebase keeps using gpu_execute/emit_ptx_blocked. Returns NULL on
+// failure.
+Tensor* gpu_run_tensorcore(const Node* fused, GpuCtx* ctx);
+
+// Kernel-only timing for the tensor-core path, same contract as
+// gpu_time_kernel_ms.
+double gpu_time_kernel_tc_ms(Node* root, GpuCtx* ctx, int warmup, int reps);
+
 #endif

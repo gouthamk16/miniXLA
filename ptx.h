@@ -21,4 +21,20 @@ char* emit_ptx_blocked(const Node* fused);
 // just want "the current best kernel" use this name.
 char* emit_ptx(const Node* fused);
 
+// ---- TF32 tensor-core kernel (docs/research/tensorcore-and-fusion.md) ----
+// One warp per block, one mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32
+// per K-step of 8, no shared memory (every k-step reads A/B straight from
+// global memory). Deliberately the simplest correct thing, not the fastest
+// one: this is the highest-risk kernel in the codebase (a fragment-layout
+// mistake produces plausible-looking wrong numbers, not a crash), so
+// correctness-first with a wide-open follow-up (shared-memory blocking for
+// warp reuse) rather than trying to land both at once. Additive: does not
+// replace emit_ptx_blocked, which stays the default for every other caller.
+#define TC_BM 16
+#define TC_BN 8
+#define TC_BK 8
+#define TC_NTHREADS 32
+
+char* emit_ptx_tensorcore(const Node* fused);
+
 #endif

@@ -313,3 +313,197 @@ char* emit_ptx_blocked(const Node* fused) {
 }
 
 char* emit_ptx(const Node* fused) { return emit_ptx_blocked(fused); }
+
+// ---- TF32 tensor-core kernel (docs/research/tensorcore-and-fusion.md) ----
+// One warp (32 threads) per block computes one 16x8 output tile via a chain
+// of mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32, accumulating over
+// K in steps of 8. No shared memory: every k-step's A/B fragment elements
+// are read straight from global memory, converted f32->tf32 with
+// cvt.rna.tf32.f32 (RNA: keeps more mantissa than RZ, confirmed against the
+// PTX ISA cvt reference), then fed to mma. Fragment row/col formulas below
+// are transcribed verbatim from the PTX ISA "Matrix Fragments for
+// mma.m16n8k8" section (.tf32 subsection) -- not derived, not guessed, a
+// mistake here produces plausible-looking wrong numbers rather than a
+// crash, so this is copied, not adapted.
+//
+// Register plan (non-SSA, same convention as emit_ptx_blocked):
+//   .b32  r0 M, r1 N, r2 K, r3 laneid, r4 ctaid.x, r5 ctaid.y,
+//         r6 groupID, r7 threadID_in_group, r8 blockRowBase, r9 blockColBase,
+//         r10 kk (loop var), r11-15 address-computation scratch (reused
+//         per element), r16-19 A fragment (a0..a3, tf32-in-b32),
+//         r20-21 B fragment (b0..b1, tf32-in-b32), r22-24 epilogue scratch
+//   .b64  rd0 A ptr, rd1 B ptr, rd9 out ptr, rd10.. ADD epilogue operand
+//         ptrs, rd20 address scratch (reused)
+//   .f32  f0-3 accumulator (c0..c3, doubles as mma's C and D operand list
+//         across k-steps), f4-7 raw f32 scratch before tf32 conversion,
+//         f8 zero (relu), f9 bias (add epilogue)
+//   .pred p0 k-loop test, p1-3 load boundary (reused per element),
+//         p4-6 store/epilogue boundary (reused per output cell)
+char* emit_ptx_tensorcore(const Node* fused) {
+    Buf b = {0};
+    const int F_ACC = 0, F_RAW = 4, F_ZERO = 8, F_BIAS = 9;
+    const int R_A = 16, R_B = 20;
+
+    int n_add = 0;
+    for (int i = 0; i < fused->n_epilogue; i++)
+        if (fused->epilogue[i].op == OP_ADD) n_add++;
+
+    bprintf(&b,
+        ".version 8.0\n"
+        ".target sm_89\n"
+        ".address_size 64\n\n"
+        ".entry fused(\n"
+        "    .param .u64 p_a,\n"
+        "    .param .u64 p_b,\n");
+    for (int i = 0; i < n_add; i++)
+        bprintf(&b, "    .param .u64 p_op%d,\n", i);
+    bprintf(&b,
+        "    .param .u64 p_out,\n"
+        "    .param .u32 p_M,\n"
+        "    .param .u32 p_N,\n"
+        "    .param .u32 p_K\n"
+        ")\n"
+        "{\n"
+        "    .reg .f32  %%f<10>;\n"
+        "    .reg .b32  %%r<25>;\n"
+        "    .reg .b64  %%rd<21>;\n"
+        "    .reg .pred %%p<7>;\n\n");
+
+    bprintf(&b,
+        "    ld.param.u32 %%r0, [p_M];\n"
+        "    ld.param.u32 %%r1, [p_N];\n"
+        "    ld.param.u32 %%r2, [p_K];\n"
+        "    ld.param.u64 %%rd0, [p_a];\n"
+        "    ld.param.u64 %%rd1, [p_b];\n\n"
+        "    mov.u32     %%r3, %%laneid;\n"
+        "    mov.u32     %%r4, %%ctaid.x;\n"
+        "    mov.u32     %%r5, %%ctaid.y;\n"
+        "    shr.u32     %%r6, %%r3, 2;\n"       // groupID
+        "    rem.u32     %%r7, %%r3, 4;\n"       // threadID_in_group
+        "    mul.lo.u32  %%r8, %%r5, %d;\n"      // blockRowBase = ctaid.y*TC_BM
+        "    mul.lo.u32  %%r9, %%r4, %d;\n\n",   // blockColBase = ctaid.x*TC_BN
+        TC_BM, TC_BN);
+
+    for (int i = 0; i < 4; i++)
+        bprintf(&b, "    mov.f32     %%f%d, 0f00000000;\n", F_ACC + i);
+    bprintf(&b, "\n");
+
+    bprintf(&b,
+        "    mov.u32     %%r10, 0;\n"
+        "TC_LOOP:\n"
+        "    setp.ge.u32 %%p0, %%r10, %%r2;\n"
+        "    @%%p0 bra   TC_DONE;\n\n");
+
+    // A fragment: a0 row=groupID col=tid_in_group, a1 row=groupID+8
+    // col=tid_in_group, a2 row=groupID col=tid_in_group+4, a3
+    // row=groupID+8 col=tid_in_group+4 (PTX ISA 9.7.15.5.7, .tf32).
+    static const int a_row_off[4] = {0, 8, 0, 8};
+    static const int a_col_off[4] = {0, 0, 4, 4};
+    for (int i = 0; i < 4; i++) {
+        bprintf(&b,
+            "    add.u32     %%r11, %%r6, %d;\n"   // localRow
+            "    add.u32     %%r12, %%r7, %d;\n"   // localCol
+            "    add.u32     %%r13, %%r8, %%r11;\n" // globalRow
+            "    add.u32     %%r14, %%r10, %%r12;\n" // globalCol = kk + localCol
+            "    setp.lt.u32 %%p1, %%r13, %%r0;\n"
+            "    setp.lt.u32 %%p2, %%r14, %%r2;\n"
+            "    and.pred    %%p3, %%p1, %%p2;\n"
+            "    mad.lo.u32  %%r15, %%r13, %%r2, %%r14;\n"
+            "    cvt.u64.u32 %%rd20, %%r15;\n"
+            "    shl.b64     %%rd20, %%rd20, 2;\n"
+            "    add.u64     %%rd20, %%rd0, %%rd20;\n"
+            "    mov.f32     %%f%d, 0f00000000;\n"
+            "    @%%p3 ld.global.f32 %%f%d, [%%rd20];\n"
+            "    cvt.rna.tf32.f32 %%r%d, %%f%d;\n\n",
+            a_row_off[i], a_col_off[i], F_RAW, F_RAW, R_A + i, F_RAW);
+    }
+
+    // B fragment: b0 row=tid_in_group col=groupID, b1 row=tid_in_group+4
+    // col=groupID (same section).
+    static const int b_row_off[2] = {0, 4};
+    for (int i = 0; i < 2; i++) {
+        bprintf(&b,
+            "    add.u32     %%r11, %%r7, %d;\n"   // localRow
+            "    add.u32     %%r13, %%r10, %%r11;\n" // globalRow = kk + localRow
+            "    add.u32     %%r14, %%r9, %%r6;\n"  // globalCol = blockColBase + groupID
+            "    setp.lt.u32 %%p1, %%r13, %%r2;\n"
+            "    setp.lt.u32 %%p2, %%r14, %%r1;\n"
+            "    and.pred    %%p3, %%p1, %%p2;\n"
+            "    mad.lo.u32  %%r15, %%r13, %%r1, %%r14;\n"
+            "    cvt.u64.u32 %%rd20, %%r15;\n"
+            "    shl.b64     %%rd20, %%rd20, 2;\n"
+            "    add.u64     %%rd20, %%rd1, %%rd20;\n"
+            "    mov.f32     %%f%d, 0f00000000;\n"
+            "    @%%p3 ld.global.f32 %%f%d, [%%rd20];\n"
+            "    cvt.rna.tf32.f32 %%r%d, %%f%d;\n\n",
+            b_row_off[i], F_RAW, F_RAW, R_B + i, F_RAW);
+    }
+
+    bprintf(&b,
+        "    mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%%f%d,%%f%d,%%f%d,%%f%d}, {%%r%d,%%r%d,%%r%d,%%r%d}, {%%r%d,%%r%d}, {%%f%d,%%f%d,%%f%d,%%f%d};\n\n",
+        F_ACC, F_ACC+1, F_ACC+2, F_ACC+3,
+        R_A, R_A+1, R_A+2, R_A+3, R_B, R_B+1,
+        F_ACC, F_ACC+1, F_ACC+2, F_ACC+3);
+
+    bprintf(&b,
+        "    add.u32     %%r10, %%r10, %d;\n"
+        "    bra         TC_LOOP;\n"
+        "TC_DONE:\n\n",
+        TC_BK);
+
+    // Epilogue + store. C/D fragment: c0 row=groupID col=2*tid_in_group,
+    // c1 row=groupID col=2*tid_in_group+1, c2 row=groupID+8
+    // col=2*tid_in_group, c3 row=groupID+8 col=2*tid_in_group+1.
+    bprintf(&b, "    ld.param.u64 %%rd9, [p_out];\n");
+    for (int i = 0; i < n_add; i++)
+        bprintf(&b, "    ld.param.u64 %%rd%d, [p_op%d];\n", 10 + i, i);
+    bprintf(&b, "\n");
+
+    static const int c_row_off[4] = {0, 0, 8, 8};
+    static const int c_col_off[4] = {0, 1, 0, 1};
+    for (int i = 0; i < 4; i++) {
+        int acc = F_ACC + i;
+        bprintf(&b,
+            "    add.u32     %%r22, %%r6, %d;\n"          // localRow
+            "    mul.lo.u32  %%r23, %%r7, 2;\n"
+            "    add.u32     %%r23, %%r23, %d;\n"          // localCol
+            "    add.u32     %%r22, %%r8, %%r22;\n"        // globalRow
+            "    add.u32     %%r23, %%r9, %%r23;\n"        // globalCol
+            "    setp.lt.u32 %%p4, %%r22, %%r0;\n"
+            "    setp.lt.u32 %%p5, %%r23, %%r1;\n"
+            "    and.pred    %%p6, %%p4, %%p5;\n"
+            "    mad.lo.u32  %%r24, %%r22, %%r1, %%r23;\n",
+            c_row_off[i], c_col_off[i]);
+
+        int add_idx = 0;
+        for (int e = 0; e < fused->n_epilogue; e++) {
+            if (fused->epilogue[e].op == OP_ADD) {
+                bprintf(&b,
+                    "    cvt.u64.u32 %%rd20, %%r24;\n"
+                    "    shl.b64     %%rd20, %%rd20, 2;\n"
+                    "    add.u64     %%rd20, %%rd%d, %%rd20;\n"
+                    "    mov.f32     %%f%d, 0f00000000;\n"
+                    "    @%%p6 ld.global.f32 %%f%d, [%%rd20];\n"
+                    "    add.f32     %%f%d, %%f%d, %%f%d;\n",
+                    10 + add_idx, F_BIAS, F_BIAS, acc, acc, F_BIAS);
+                add_idx++;
+            } else if (fused->epilogue[e].op == OP_RELU) {
+                bprintf(&b,
+                    "    mov.f32     %%f%d, 0f00000000;\n"
+                    "    max.f32     %%f%d, %%f%d, %%f%d;\n",
+                    F_ZERO, acc, acc, F_ZERO);
+            }
+        }
+
+        bprintf(&b,
+            "    cvt.u64.u32 %%rd20, %%r24;\n"
+            "    shl.b64     %%rd20, %%rd20, 2;\n"
+            "    add.u64     %%rd20, %%rd9, %%rd20;\n"
+            "    @%%p6 st.global.f32 [%%rd20], %%f%d;\n\n",
+            acc);
+    }
+
+    bprintf(&b, "    ret;\n}\n");
+    return b.s;
+}

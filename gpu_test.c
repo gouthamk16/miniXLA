@@ -334,6 +334,101 @@ static void bench_large_matmul(void) {
     printf("bench_large_matmul PASS\n");
 }
 
+// ---- Test: TF32 tensor-core kernel correctness (emit_ptx_tensorcore,
+// docs/research/tensorcore-and-fusion.md) ----
+//
+// Tolerance is wider than the CUDA-core kernel's and explicitly scales with
+// sqrt(K): TF32 keeps ~11 mantissa bits (vs FP32's 23), so each of the K
+// per-element products carries relative error of order 2^-11: for random
+// signs those errors accumulate like a random walk, so absolute error in
+// the K-reduction grows ~sqrt(K), not ~K. atol below is calibrated for this
+// test's operand range (|value| <= 10, so per-product magnitude <= 100);
+// a different operand range would need a different constant, not a
+// different sqrt(K) shape. rtol covers large-magnitude outputs where the
+// absolute term alone would be too tight.
+static int approx_tensorcore(const Tensor* cpu, const Tensor* gpu, int K) {
+    if (cpu->size != gpu->size) return 0;
+    double atol = 0.05 * sqrt((double)K), rtol = 0.02;
+    for (size_t i = 0; i < cpu->size; i++) {
+        double d = fabs(cpu->data[i] - gpu->data[i]);
+        if (d > atol + rtol * fabs(cpu->data[i])) return 0;
+    }
+    return 1;
+}
+
+static Tensor* rand_tensor_tc(int r, int c) {
+    float* d = malloc(sizeof(float) * r * c);
+    for (int i = 0; i < r * c; i++) d[i] = ((float)(rand() % 2000) - 1000) / 100.0f;
+    Tensor* t = create_tensor(d, (int[]){r, c}, 2);
+    free(d);
+    return t;
+}
+
+static void tc_case(int M, int K, int N, const char* label) {
+    Tensor* a = rand_tensor_tc(M, K);
+    Tensor* b = rand_tensor_tc(K, N);
+    Node* root = fused_node(input_node(a), input_node(b), NULL, 0);
+
+    Tensor* cpu_out = matmul(a, b);
+    GpuCtx* ctx = gpu_ctx_create();
+    assert(ctx);
+    Tensor* gpu_out = gpu_run_tensorcore(root, ctx);
+    gpu_ctx_destroy(ctx);
+
+    assert(gpu_out);
+    if (!approx_tensorcore(cpu_out, gpu_out, K)) {
+        fprintf(stderr, "test_tensorcore_correctness: %s (%dx%dx%d) FAILED\n", label, M, K, N);
+        assert(0);
+    }
+
+    free_tensor(cpu_out); free_tensor(gpu_out);
+    free_graph(root); free_tensor(a); free_tensor(b);
+}
+
+// Boundary-ragged shapes (not just clean multiples of the 16x8x8 tile), plus
+// one large enough to exercise many K-loop iterations -- same philosophy as
+// the diamond-DAG tests above: the bugs that matter show up off the clean
+// cases, and a fragment-layout mistake here would be a *plausible-looking*
+// wrong number, not a crash, so ragged coverage matters more than usual.
+static void test_tensorcore_correctness(void) {
+    srand(42);
+    tc_case(16, 8, 8, "exact tile");
+    tc_case(17, 8, 8, "M ragged");
+    tc_case(16, 8, 9, "N ragged");
+    tc_case(16, 5, 8, "K ragged");
+    tc_case(100, 100, 100, "ragged everywhere");
+    tc_case(1024, 1024, 1024, "1024^3");
+    tc_case(2048, 2048, 2049, "2048x2048x2049 ragged N");
+    printf("test_tensorcore_correctness PASS\n");
+}
+
+// Same shape but with an ADD+RELU epilogue, to cover the tensor-core
+// emitter's epilogue path (untested by the matmul-only cases above).
+static void test_tensorcore_epilogue(void) {
+    srand(7);
+    int M = 100, K = 100, N = 100;
+    Tensor* a = rand_tensor_tc(M, K);
+    Tensor* b = rand_tensor_tc(K, N);
+    Tensor* c = rand_tensor_tc(M, N);
+    EpStep ep[2] = {{OP_ADD, input_node(c)}, {OP_RELU, NULL}};
+    Node* root = fused_node(input_node(a), input_node(b), ep, 2);
+
+    Tensor* mm = matmul(a, b);
+    Tensor* added = tensor_add(mm, c);
+    Tensor* cpu_out = relu(added);
+    GpuCtx* ctx = gpu_ctx_create();
+    assert(ctx);
+    Tensor* gpu_out = gpu_run_tensorcore(root, ctx);
+    gpu_ctx_destroy(ctx);
+
+    assert(gpu_out);
+    assert(approx_tensorcore(cpu_out, gpu_out, K));
+
+    free_tensor(mm); free_tensor(added); free_tensor(cpu_out); free_tensor(gpu_out);
+    free_graph(root); free_tensor(a); free_tensor(b); free_tensor(c);
+    printf("test_tensorcore_epilogue PASS\n");
+}
+
 int main(void) {
     test_single_fused();
     test_broadcast_bias_rejected_on_gpu();
@@ -342,6 +437,8 @@ int main(void) {
     test_deep_chain();
     test_module_cache();
     bench_large_matmul();
+    test_tensorcore_correctness();
+    test_tensorcore_epilogue();
     printf("all gpu tests PASS\n");
     return 0;
 }
