@@ -8,11 +8,11 @@
 // computes a TMxTN grid of output cells instead of one. Fixed constants for
 // now (not yet autotuned -- see the research doc's priority list). Threads
 // per block is a 1D count, not a tile x tile square.
-#define GEMM_BM 64
-#define GEMM_BN 64
+#define GEMM_BM 128
+#define GEMM_BN 128
 #define GEMM_BK 8
-#define GEMM_TM 4
-#define GEMM_TN 4
+#define GEMM_TM 8
+#define GEMM_TN 8
 #define GEMM_NTHREADS ((GEMM_BM / GEMM_TM) * (GEMM_BN / GEMM_TN))
 
 char* emit_ptx_blocked(const Node* fused);

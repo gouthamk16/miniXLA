@@ -39,20 +39,26 @@ static void bprintf(Buf* b, const char* fmt, ...) {
 // unrolled inner loop, so a never-reuse counter would need hundreds of
 // names for no benefit; every reused slot below is fully consumed in
 // program order before its next reuse, so this is safe non-SSA PTX, not a
-// hazard):
+// hazard). The .f32 side and the epilogue's outCol array scale with TM/TN
+// (computed as F_*/R_* locals below, not hardcoded) since accumulators
+// alone need TM*TN registers -- a fixed layout sized for TM=TN=4 would
+// silently collide the moment either grows (e.g. regM overlapping
+// still-live accumulators). The .b64/.pred side doesn't depend on TM/TN
+// and stays fixed:
 //   .b32  r0 M, r1 N, r2 K, r3 tid, r4 blockCol, r5 blockRow,
 //         r6 threadRow, r7 threadCol, r8 rowBase, r9 colBase, r10 kTile,
 //         r11-16 cooperative-load scratch (reused x4: A it0/it1, B it0/it1),
 //         r17-18 setup-only scratch, r19 outRowBase, r20 outColBase,
-//         r21-24 outCol[0..TN), r25-26 epilogue scratch, r27-28 setup-only
+//         R_OUTCOL.. outCol[0..TN) (dynamic base), then R_EPI_ROW/R_EPI_IDX
+//         (epilogue scratch), then R_SETUP_A/R_SETUP_B (setup-only)
 //   .b64  rd0 A ptr, rd1 B ptr, rd2 As base, rd3 Bs base,
 //         rd4 As write addr (scratch), rd5 Bs write addr (scratch),
 //         rd6 global read addr (scratch), rd7 As read base (persistent),
 //         rd8 Bs read base (persistent), rd9 out ptr,
 //         rd10.. one per ADD epilogue operand (persistent),
 //         rd50-51 setup-only scratch, rd60 epilogue read scratch, rd61 epilogue store scratch
-//   .f32  f0-15 accumulators (TM*TN), f16-19 regM (TM), f20-23 regN (TN),
-//         f30 cooperative-load scratch, f31 epilogue bias scratch, f32 epilogue zero scratch
+//   .f32  F_ACC.. accumulators (TM*TN), F_REGM.. regM (TM), F_REGN.. regN (TN),
+//         F_SCRATCH cooperative-load scratch, F_BIAS epilogue bias, F_ZERO epilogue zero
 //   .pred p0 tile-loop test, p1-3 load boundary (reused x4), p4-6 epilogue boundary (reused per cell)
 char* emit_ptx_blocked(const Node* fused) {
     Buf b = {0};
@@ -60,6 +66,19 @@ char* emit_ptx_blocked(const Node* fused) {
     const int NTHREADS = GEMM_NTHREADS;
     const int A_ELEMS = BM * BK, B_ELEMS = BK * BN;
     const int A_ITERS = A_ELEMS / NTHREADS, B_ITERS = B_ELEMS / NTHREADS;
+
+    // Register bases scale with TM/TN (accumulators alone need TM*TN
+    // registers) so they're computed, not hardcoded -- a fixed layout sized
+    // for TM=TN=4 would silently collide (e.g. regM overlapping still-live
+    // accumulators) the moment either grows. See the register-plan comment
+    // above the struct-less layout below for the .b64/.pred side, which
+    // doesn't scale with TM/TN and stays fixed.
+    const int F_ACC = 0, F_REGM = TM * TN, F_REGN = F_REGM + TM;
+    const int F_SCRATCH = F_REGN + TN, F_BIAS = F_SCRATCH + 1, F_ZERO = F_SCRATCH + 2;
+    const int F_POOL = F_ZERO + 1;
+    const int R_OUTCOL = 21, R_EPI_ROW = R_OUTCOL + TN, R_EPI_IDX = R_EPI_ROW + 1;
+    const int R_SETUP_A = R_EPI_IDX + 1, R_SETUP_B = R_SETUP_A + 1;
+    const int R_POOL = R_SETUP_B + 1;
 
     int n_add = 0;
     for (int i = 0; i < fused->n_epilogue; i++)
@@ -81,13 +100,13 @@ char* emit_ptx_blocked(const Node* fused) {
         "    .param .u32 p_K\n"
         ")\n"
         "{\n"
-        "    .reg .f32  %%f<64>;\n"
-        "    .reg .b32  %%r<40>;\n"
+        "    .reg .f32  %%f<%d>;\n"
+        "    .reg .b32  %%r<%d>;\n"
         "    .reg .b64  %%rd<80>;\n"
         "    .reg .pred %%p<8>;\n"
         "    .shared .align 16 .b8 As[%d];\n"
         "    .shared .align 16 .b8 Bs[%d];\n\n",
-        A_ELEMS * 4, B_ELEMS * 4);
+        F_POOL, R_POOL, A_ELEMS * 4, B_ELEMS * 4);
 
     // ---- params, thread/block indices ----
     bprintf(&b,
@@ -121,7 +140,7 @@ char* emit_ptx_blocked(const Node* fused) {
 
     // ---- accumulators ----
     for (int i = 0; i < TM * TN; i++)
-        bprintf(&b, "    mov.f32     %%f%d, 0f00000000;\n", i);
+        bprintf(&b, "    mov.f32     %%f%d, 0f00000000;\n", F_ACC + i);
     bprintf(&b, "\n");
 
     // ---- outer k-tile loop ----
@@ -152,14 +171,14 @@ char* emit_ptx_blocked(const Node* fused) {
             "    cvt.u64.u32 %%rd6, %%r16;\n"
             "    shl.b64     %%rd6, %%rd6, 2;\n"
             "    add.u64     %%rd6, %%rd0, %%rd6;\n"
-            "    mov.f32     %%f30, 0f00000000;\n"
-            "    @%%p3 ld.global.f32 %%f30, [%%rd6];\n"
+            "    mov.f32     %%f%d, 0f00000000;\n"
+            "    @%%p3 ld.global.f32 %%f%d, [%%rd6];\n"
             "    mad.lo.u32  %%r16, %%r13, %d, %%r12;\n" // writeIdx = acol*BM + arow (transposed)
             "    cvt.u64.u32 %%rd4, %%r16;\n"
             "    shl.b64     %%rd4, %%rd4, 2;\n"
             "    add.u64     %%rd4, %%rd2, %%rd4;\n"
-            "    st.shared.f32 [%%rd4], %%f30;\n\n",
-            e, BK, e, BK, BM);
+            "    st.shared.f32 [%%rd4], %%f%d;\n\n",
+            e, BK, e, BK, F_SCRATCH, F_SCRATCH, BM, F_SCRATCH);
     }
 
     // Cooperative load of Bs[BK][BN] from B[kTile.., colBase..]
@@ -178,43 +197,50 @@ char* emit_ptx_blocked(const Node* fused) {
             "    cvt.u64.u32 %%rd6, %%r16;\n"
             "    shl.b64     %%rd6, %%rd6, 2;\n"
             "    add.u64     %%rd6, %%rd1, %%rd6;\n"
-            "    mov.f32     %%f30, 0f00000000;\n"
-            "    @%%p3 ld.global.f32 %%f30, [%%rd6];\n"
+            "    mov.f32     %%f%d, 0f00000000;\n"
+            "    @%%p3 ld.global.f32 %%f%d, [%%rd6];\n"
             "    cvt.u64.u32 %%rd5, %s;\n"
             "    shl.b64     %%rd5, %%rd5, 2;\n"
             "    add.u64     %%rd5, %%rd3, %%rd5;\n"
-            "    st.shared.f32 [%%rd5], %%f30;\n\n",
-            e, BN, e, BN, e);
+            "    st.shared.f32 [%%rd5], %%f%d;\n\n",
+            e, BN, e, BN, F_SCRATCH, F_SCRATCH, e, F_SCRATCH);
     }
 
     bprintf(&b, "    bar.sync    0;\n\n");
 
     // ---- compute: unrolled kk = 0..BK-1 ----
-    // regM/regN loads are vectorized (ld.shared.v4.f32, one instruction for
-    // all TM/TN values instead of TM/TN scalar loads) when TM==TN==4 -- the
-    // only per-thread tile size this emitter currently generates. As is
-    // stored transposed specifically so this regM load is contiguous (see
-    // the cooperative-load comment above); regN's is contiguous in B's
-    // natural layout already. Falls back to scalar loads if that ever
-    // changes, so a future TM/TN tweak fails to compile cleanly rather than
-    // silently emitting a wrong vector load.
+    // regM/regN loads are vectorized (ld.shared.v4.f32 per 4-element chunk,
+    // one instruction per 4 values instead of 4 scalar loads) whenever
+    // TM/TN is a multiple of 4 -- true for every per-thread tile size this
+    // emitter has generated so far (4 and 8). As is stored transposed
+    // specifically so the regM chunks are contiguous (see the cooperative-
+    // load comment above); regN's are contiguous in B's natural layout
+    // already. Falls back to scalar loads for a TM/TN this doesn't evenly
+    // divide, so a future odd tile size fails to compile cleanly rather
+    // than silently emitting a wrong vector load.
     for (int kk = 0; kk < BK; kk++) {
-        if (TM == 4) {
-            bprintf(&b, "    ld.shared.v4.f32 {%%f16,%%f17,%%f18,%%f19}, [%%rd7+%d];\n", kk * BM * 4);
+        if (TM % 4 == 0) {
+            for (int c = 0; c < TM; c += 4)
+                bprintf(&b, "    ld.shared.v4.f32 {%%f%d,%%f%d,%%f%d,%%f%d}, [%%rd7+%d];\n",
+                        F_REGM + c, F_REGM + c + 1, F_REGM + c + 2, F_REGM + c + 3,
+                        (kk * BM + c) * 4);
         } else {
             for (int i = 0; i < TM; i++)
-                bprintf(&b, "    ld.shared.f32 %%f%d, [%%rd7+%d];\n", 16 + i, (kk * BM + i) * 4);
+                bprintf(&b, "    ld.shared.f32 %%f%d, [%%rd7+%d];\n", F_REGM + i, (kk * BM + i) * 4);
         }
-        if (TN == 4) {
-            bprintf(&b, "    ld.shared.v4.f32 {%%f20,%%f21,%%f22,%%f23}, [%%rd8+%d];\n", kk * BN * 4);
+        if (TN % 4 == 0) {
+            for (int c = 0; c < TN; c += 4)
+                bprintf(&b, "    ld.shared.v4.f32 {%%f%d,%%f%d,%%f%d,%%f%d}, [%%rd8+%d];\n",
+                        F_REGN + c, F_REGN + c + 1, F_REGN + c + 2, F_REGN + c + 3,
+                        (kk * BN + c) * 4);
         } else {
             for (int j = 0; j < TN; j++)
-                bprintf(&b, "    ld.shared.f32 %%f%d, [%%rd8+%d];\n", 20 + j, (kk * BN + j) * 4);
+                bprintf(&b, "    ld.shared.f32 %%f%d, [%%rd8+%d];\n", F_REGN + j, (kk * BN + j) * 4);
         }
         for (int i = 0; i < TM; i++)
             for (int j = 0; j < TN; j++)
                 bprintf(&b, "    fma.rn.f32  %%f%d, %%f%d, %%f%d, %%f%d;\n",
-                        i * TN + j, 16 + i, 20 + j, i * TN + j);
+                        F_ACC + i * TN + j, F_REGM + i, F_REGN + j, F_ACC + i * TN + j);
         bprintf(&b, "\n");
     }
 
@@ -231,54 +257,54 @@ char* emit_ptx_blocked(const Node* fused) {
         bprintf(&b, "    ld.param.u64 %%rd%d, [p_op%d];\n", 10 + i, i);
 
     bprintf(&b,
-        "    mul.lo.u32  %%r27, %%r6, %d;\n"     // threadRow*TM
-        "    add.u32     %%r19, %%r8, %%r27;\n"  // outRowBase
-        "    mul.lo.u32  %%r28, %%r7, %d;\n"      // threadCol*TN
-        "    add.u32     %%r20, %%r9, %%r28;\n\n", // outColBase
-        TM, TN);
+        "    mul.lo.u32  %%r%d, %%r6, %d;\n"     // threadRow*TM
+        "    add.u32     %%r19, %%r8, %%r%d;\n"  // outRowBase
+        "    mul.lo.u32  %%r%d, %%r7, %d;\n"      // threadCol*TN
+        "    add.u32     %%r20, %%r9, %%r%d;\n\n", // outColBase
+        R_SETUP_A, TM, R_SETUP_A, R_SETUP_B, TN, R_SETUP_B);
     for (int j = 0; j < TN; j++)
-        bprintf(&b, "    add.u32     %%r%d, %%r20, %d;\n", 21 + j, j);
+        bprintf(&b, "    add.u32     %%r%d, %%r20, %d;\n", R_OUTCOL + j, j);
     bprintf(&b, "\n");
 
     for (int i = 0; i < TM; i++) {
         bprintf(&b,
-            "    add.u32     %%r25, %%r19, %d;\n"
-            "    setp.lt.u32 %%p4, %%r25, %%r0;\n",
-            i);
+            "    add.u32     %%r%d, %%r19, %d;\n"
+            "    setp.lt.u32 %%p4, %%r%d, %%r0;\n",
+            R_EPI_ROW, i, R_EPI_ROW);
         for (int j = 0; j < TN; j++) {
-            int acc = i * TN + j;
+            int acc = F_ACC + i * TN + j;
             bprintf(&b,
                 "    setp.lt.u32 %%p5, %%r%d, %%r1;\n"
                 "    and.pred    %%p6, %%p4, %%p5;\n"
-                "    mad.lo.u32  %%r26, %%r25, %%r1, %%r%d;\n",
-                21 + j, 21 + j);
+                "    mad.lo.u32  %%r%d, %%r%d, %%r1, %%r%d;\n",
+                R_OUTCOL + j, R_EPI_IDX, R_EPI_ROW, R_OUTCOL + j);
 
             int add_idx = 0;
             for (int e = 0; e < fused->n_epilogue; e++) {
                 if (fused->epilogue[e].op == OP_ADD) {
                     bprintf(&b,
-                        "    cvt.u64.u32 %%rd60, %%r26;\n"
+                        "    cvt.u64.u32 %%rd60, %%r%d;\n"
                         "    shl.b64     %%rd60, %%rd60, 2;\n"
                         "    add.u64     %%rd60, %%rd%d, %%rd60;\n"
-                        "    mov.f32     %%f31, 0f00000000;\n"
-                        "    @%%p6 ld.global.f32 %%f31, [%%rd60];\n"
-                        "    add.f32     %%f%d, %%f%d, %%f31;\n",
-                        10 + add_idx, acc, acc);
+                        "    mov.f32     %%f%d, 0f00000000;\n"
+                        "    @%%p6 ld.global.f32 %%f%d, [%%rd60];\n"
+                        "    add.f32     %%f%d, %%f%d, %%f%d;\n",
+                        R_EPI_IDX, 10 + add_idx, F_BIAS, F_BIAS, acc, acc, F_BIAS);
                     add_idx++;
                 } else if (fused->epilogue[e].op == OP_RELU) {
                     bprintf(&b,
-                        "    mov.f32     %%f32, 0f00000000;\n"
-                        "    max.f32     %%f%d, %%f%d, %%f32;\n",
-                        acc, acc);
+                        "    mov.f32     %%f%d, 0f00000000;\n"
+                        "    max.f32     %%f%d, %%f%d, %%f%d;\n",
+                        F_ZERO, acc, acc, F_ZERO);
                 }
             }
 
             bprintf(&b,
-                "    cvt.u64.u32 %%rd61, %%r26;\n"
+                "    cvt.u64.u32 %%rd61, %%r%d;\n"
                 "    shl.b64     %%rd61, %%rd61, 2;\n"
                 "    add.u64     %%rd61, %%rd9, %%rd61;\n"
                 "    @%%p6 st.global.f32 [%%rd61], %%f%d;\n\n",
-                acc);
+                R_EPI_IDX, acc);
         }
     }
 
