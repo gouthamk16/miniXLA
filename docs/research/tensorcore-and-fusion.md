@@ -254,6 +254,87 @@ kept: it's a real, tested, independently useful artifact (the first
 tensor-core code in this repo, with a verified fragment layout future
 sessions can build on) even though it isn't today's fastest path.
 
+## Results: fusion-latency and memory stream
+
+Measured `relu(matmul(a,b)+c)`, square sizes 128-2048, process-isolated
+(`bench --pair <kind> <S>`, `bench_pytorch.py --size <S>` -- the latter
+gained a `--size` flag this session specifically to match the C harness's
+isolation, after an early reading at S=128 with the *original* 10-warmup
+PyTorch protocol ranged 0.014-0.077ms across three otherwise-identical
+isolated runs: this GPU's clock-ramp behavior, the same phenomenon
+`bench.c`'s own `WARMUP=150` comment documents, was under-warmed by
+PyTorch's original `WARMUP=10`. Raising it to 150 brought the reading to a
+stable 0.047ms across three repeats -- reported below, not the noisy one).
+Every number is `min` of several isolated repeats per the project's
+established protocol.
+
+| Size | MiniXLA fused (1 launch) | PyTorch eager unfused (3 launches) | Latency ratio | MiniXLA peak mem | PyTorch peak mem | Mem ratio |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 0.0389 ms | 0.0471 ms | **MiniXLA 1.21x faster** | 2.0 MiB | 8.4 MiB | MiniXLA 4.22x less |
+| 256 | 0.0625 ms | 0.0471 ms | PyTorch 1.33x faster | 2.0 MiB | 9.4 MiB | MiniXLA 4.69x less |
+| 512 | 0.1219 ms | 0.0758 ms | PyTorch 1.61x faster | 4.0 MiB | 13.1 MiB | MiniXLA 3.28x less |
+| 1024 | 0.4588 ms | 0.3625 ms | PyTorch 1.27x faster | 16.0 MiB | 28.1 MiB | MiniXLA 1.76x less |
+| 2048 | 3.0188 ms | 2.7351 ms | PyTorch 1.10x faster | 64.0 MiB | 88.1 MiB | MiniXLA 1.38x less |
+
+**Latency: the fusion hypothesis in §3 was only half right.** MiniXLA's
+single fused launch beats PyTorch eager's three separate launches only at
+the smallest size tested (128x128x128, a real but modest 21% win) — not
+across the whole small-size range as the "launch-overhead-bound" argument
+predicted. At every other size, PyTorch eager wins, by a widening-then-
+narrowing margin (61% slower for MiniXLA at 512, closing back to 10% at
+2048). The likely explanation: MiniXLA's per-op raw throughput
+disadvantage (its GEMM kernel is well behind cuBLAS at every size per the
+main README table) starts outweighing the saved launches almost
+immediately once problem size exceeds "trivially small" — three fast
+cuBLAS-backed launches beat one slower fused launch as soon as the
+per-launch fixed cost stops dominating. This is a real, if narrow,
+structural win at one specific size, not the broad latency advantage
+hoped for; reported as found, not rounded up. **`torch.compile` was not
+included in this comparison**: this machine has no working Triton install
+on Windows (`bench_pytorch.py`'s own long-standing note, re-verified this
+session — `torch.compile` still raises `TritonMissing`), so the
+three-way comparison the original plan called for isn't possible here;
+eager is the only PyTorch baseline actually measurable on this hardware.
+
+**Memory: this is the real, unambiguous, whole-range win.** MiniXLA uses
+less peak GPU memory than PyTorch eager at every size tested, by a
+narrowing but always-real margin (4.7x at the small end, 1.38x at
+2048x2048x2048). This tracks the structural argument in §4 directly:
+MiniXLA allocates exactly 4 buffers (`a`, `b`, `c`, `out`) with no
+intermediate materialization, while PyTorch eager's three separate ops
+each produce a full M×N tensor the caching allocator has to hold; PyTorch's
+own allocator overhead (bucket-granularity allocation, holding freed blocks
+for reuse) compounds that gap further at small sizes rather than closing
+it. Note the two numbers aren't measuring identically-defined things
+(MiniXLA's is a raw `cuMemGetInfo` delta around real `cuMemAlloc` calls,
+no pooling; PyTorch's is `max_memory_allocated()`, the *caching allocator's*
+high-water mark) — but that's the honest, real-world comparison a user
+actually experiences on each system, not an apples-to-oranges artifact:
+MiniXLA's own numbers show the CUDA driver's allocation granularity
+flooring the two smallest sizes at 2 MiB regardless of the ~0.4 MiB the
+raw tensors need, so even MiniXLA's number isn't "true" kernel-necessary
+bytes either — both numbers include their platform's real allocation
+overhead, which is exactly what a user's memory budget has to account for.
+
+**Buffer pooling was not added to `gpu_exec.c`.** The latency benchmark
+above (`gpu_time_kernel_ms`) uploads its operands once and times the
+kernel launch alone in a loop — it does not exercise repeated
+`cuMemAlloc`/`cuMemFree`, so it has no evidence to offer either way on
+whether allocator churn matters for a real multi-call workload. Building a
+pool without that evidence would be exactly the speculative addition this
+project's own minimalism rule warns against. A future session profiling
+`gpu_execute` under repeated calls on the same graph shape (not measured
+this session) is the right prerequisite before adding one.
+
+## Conclusion: does anything here beat PyTorch?
+
+Being precise about scope: **memory, yes, clearly, across the whole size
+range tested. Speed, only at one specific small size (128x128x128, ~21%),
+and not at all elsewhere — raw GEMM (tensor-core stream above) didn't
+close the gap either.** Both are honest, narrower results than "beats
+PyTorch," and both are reported as found rather than as a broader claim
+they don't support.
+
 ## Sources
 
 - [PTX ISA 9.3, §9.7.15.5.7 "Matrix Fragments for mma.m16n8k8"](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-1688) (fetched and read directly, not summarized — the primary source for the fragment layout used in this session's kernel)

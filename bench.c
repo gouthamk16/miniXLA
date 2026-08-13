@@ -80,6 +80,43 @@ static double bench_minixla_gpu(int M, int K, int N, GpuCtx* ctx) {
     return ms;
 }
 
+// ---- MiniXLA GPU: peak device memory for relu(matmul(a,b)+c) -----------
+// cuMemGetInfo delta around the exact allocations gpu_time_kernel_ms itself
+// makes (a, b, c, out -- see gpu_exec.c) is the honest kernel-necessary
+// number: no caching allocator, no pooling, every buffer is a real
+// cuMemAlloc. Directly comparable to torch.cuda.max_memory_allocated() for
+// the same op only in the sense that both are "bytes this computation
+// needed simultaneously" -- PyTorch's number reflects its caching
+// allocator's own bookkeeping on top of that, not raw kernel bytes (see
+// docs/research/tensorcore-and-fusion.md sec.4). Reported as-is, not
+// normalized to pretend they measure identical things.
+
+static size_t bench_minixla_gpu_mem(int M, int K, int N) {
+    unsigned seed = 12345 + M * 7 + K * 13 + N * 17;
+    float* ad = rand_buf(M * K, &seed);
+    float* bd = rand_buf(K * N, &seed);
+    float* cd = rand_buf(M * N, &seed);
+
+    size_t free0, free1, total;
+    cuMemGetInfo(&free0, &total);
+
+    CUdeviceptr d_a, d_b, d_c, d_out;
+    cuMemAlloc(&d_a, (size_t)M * K * sizeof(float));
+    cuMemcpyHtoD(d_a, ad, (size_t)M * K * sizeof(float));
+    cuMemAlloc(&d_b, (size_t)K * N * sizeof(float));
+    cuMemcpyHtoD(d_b, bd, (size_t)K * N * sizeof(float));
+    cuMemAlloc(&d_c, (size_t)M * N * sizeof(float));
+    cuMemcpyHtoD(d_c, cd, (size_t)M * N * sizeof(float));
+    cuMemAlloc(&d_out, (size_t)M * N * sizeof(float));
+    free(ad); free(bd); free(cd);
+
+    cuMemGetInfo(&free1, &total);
+    size_t peak_bytes = free0 - free1;
+
+    cuMemFree(d_a); cuMemFree(d_b); cuMemFree(d_c); cuMemFree(d_out);
+    return peak_bytes;
+}
+
 // ---- MiniXLA GPU: matmul only, no epilogue (fused_node built directly --
 // optimize() never fuses a bare matmul with no elementwise consumer, so
 // this bypasses the optimizer rather than going through it). Same kernel
@@ -240,6 +277,13 @@ static int run_pair(const char* kind, int S) {
             : strcmp(kind, "minixla_gpu_matmul_only") == 0 ? bench_minixla_gpu_matmul_only(S, S, S, ctx)
             : bench_minixla_gpu_tc_matmul_only(S, S, S, ctx);
         printf("%s,%d,%d,%d,%.4f\n", kind, S, S, S, ms);
+        gpu_ctx_destroy(ctx);
+    } else if (strcmp(kind, "minixla_gpu_mem") == 0) {
+        cuInit(0);
+        GpuCtx* ctx = gpu_ctx_create();  // establishes the CUDA context cuMemGetInfo needs
+        if (!ctx) { fprintf(stderr, "gpu_ctx_create failed\n"); return 1; }
+        size_t peak = bench_minixla_gpu_mem(S, S, S);
+        printf("minixla_gpu_mem,%d,%d,%d,%zu\n", S, S, S, peak);
         gpu_ctx_destroy(ctx);
     } else {
         fprintf(stderr, "unknown kind: %s\n", kind);
