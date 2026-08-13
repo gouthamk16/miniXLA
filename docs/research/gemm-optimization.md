@@ -113,6 +113,54 @@ fast-but-wrong kernel is worse than no change at all — that gate has no
 analogue in the training-loop version and is the one thing added, not
 removed, from the original mechanism.
 
+## Results (autoresearch/aug13, full log in results.tsv)
+
+| Experiment | GFLOPS @ 2048³ | % of cuBLAS | Status |
+|---|---|---|---|
+| Baseline (corrected kernel-only timing) | 1225.3 | 12.9% | — |
+| 1. 2D register blocking (BM=BN=64, TM=TN=4) | 4269.0 | 44.9% | kept |
+| 2. Vectorized SMEM reads (transposed A) | 4308.5 | 45.4% | kept |
+| 3. Larger tile (BM=BN=128, TM=TN=8) | 5030.7 | 53.0% | kept |
+| BK 8→16 | 5009.6 | 52.7% | discarded (no change) |
+
+4.1× over baseline, entirely on CUDA cores, correctness-gated at every
+step against the CPU reference across boundary-ragged and large shapes.
+**Not** PyTorch/cuBLAS parity — see below for why, honestly.
+
+## Why this doesn't reach PyTorch's numbers, and what would
+
+Stopping here rather than continuing to grid-search tile sizes or attempt
+warp-tiling/tensor cores is a deliberate risk call, not running out of
+ideas:
+
+- **Global-memory load vectorization** (next on the original priority
+  list) needs more than a tweak: the current cooperative-load thread-to-
+  element mapping has each thread's 4 loads landing on the *same* K-column
+  at different, non-adjacent M-rows (a consequence of `NTHREADS` being a
+  clean multiple of `BK`), not 4 contiguous floats — vectorizing it means
+  redesigning which elements each thread owns, plus correctly handling a
+  vectorized load's boundary case (a `v4` load is all-or-nothing; the
+  current scalar predicated-zero-pad trick doesn't extend to it directly).
+  Real, but a redesign, not a follow-up line.
+- **Warp-tiling** (siboehm: 84.8%→93.7% of cuBLAS, the single largest
+  remaining CUDA-core lever) restructures the thread hierarchy itself
+  (block → warp tile → thread tile) rather than tuning existing
+  parameters. Bigger surface area for a subtle indexing bug than anything
+  attempted so far.
+- **TF32 tensor cores** are almost certainly the actual majority of the
+  remaining gap (see this doc's opening section) — cuBLAS's default math
+  mode on Ampere+ uses them for FP32 GEMM; nothing here does. This is a
+  different instruction class (`mma.sync`, warp-distributed fragment
+  layouts) with a failure mode worse than a crash: a fragment-layout
+  mistake produces *plausible-looking wrong numbers*, not a build error.
+
+All three are real next experiments, not abandoned; they're the reason
+this stopped at a solid, fully-verified 53% instead of pushing further
+under time pressure into the highest-risk-of-silent-corruption part of the
+plan. A session with a larger correctness-verification budget (more time
+per experiment to stress-test boundary cases, ideally a second GPU to
+cross-check against) is the right context to attempt them.
+
 ## Sources
 
 - [siboehm, "How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog"](https://siboehm.com/articles/22/CUDA-MMM)
