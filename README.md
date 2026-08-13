@@ -31,6 +31,12 @@ full in [the report](docs/bench_report.html):
 <img src="docs/images/chart-gflops.png" alt="GFLOPS vs matrix size, log scale: cuBLAS, PyTorch, and MiniXLA GPU" width="700">
 <img src="docs/images/chart-cpu-vs-gpu.png" alt="MiniXLA GPU vs its own naive CPU matmul, log scale, up to 557x at 1024x1024" width="700">
 
+(The CPU number in that second chart is MiniXLA's own naive triple-loop matmul,
+not a competing implementation. It exists as the correctness reference the
+GPU kernel is checked against, not as something meant to be fast; the chart
+is there to show why a compiler that emits real kernels is worth having at
+all, not to claim a CPU win over anything.)
+
 That 2048×2048 number was 12.9% of cuBLAS at the start of one session. Getting
 it to 84.3% took two separate things, both written up honestly, mistakes
 included: a [research pass](docs/research/gemm-optimization.md) that took the
@@ -63,8 +69,9 @@ g_matmul / g_add / g_relu / …
    gpu_execute()         CUDA Driver API, module cache, last-use free
 ```
 
-CPU `execute()` runs the same optimized graph. GPU results are checked
-against that reference.
+CPU `execute()` runs the same optimized graph. It exists as a correctness
+reference for the GPU path, not as a fast path in its own right; GPU results
+are checked against it.
 
 ## Example
 
