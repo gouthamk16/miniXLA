@@ -15,7 +15,14 @@
 #include "ptx.h"
 #include "gpu_exec.h"
 
-#define WARMUP 10
+// WARMUP is deliberately high, not the 10 an isolated benchmark would need:
+// this GPU idles down to ~210MHz between bursts (nvidia-smi-confirmed, see
+// the benchmark report's methodology notes) and a short run of sub-ms
+// kernels can finish before the clock governor reacts and ramps back up --
+// confirmed by reproducing a spurious ~7x slowdown at one size (cuBLAS and
+// MiniXLA both, isolated repro gave the expected fast number) that a 10x
+// warmup wasn't consistently absorbing across a full 5-size sweep.
+#define WARMUP 150
 #define REPS   20
 
 static float* rand_buf(int n, unsigned* seed) {
@@ -177,7 +184,53 @@ static double bench_minixla_cpu(int M, int K, int N) {
     return result;
 }
 
-int main(void) {
+// Running every (system, size) pair in one process/CUDA context -- the
+// original design -- turned out not to be neutral: a run of the full sweep
+// reproducibly showed cuBLAS (and separately, MiniXLA) reading ~7x slower
+// at exactly one size (512) than an isolated single-pair run of the exact
+// same call sequence, with GPU temperature ruling out thermal throttling
+// and a 5x larger warmup count not fixing it either. That points at a
+// cross-system interaction (allocator state, driver/cuBLAS internal
+// heuristics) specific to sharing one process across systems, not a
+// warmup or thermal issue -- and it's exactly the kind of confound
+// process isolation is supposed to rule out. `--pair <kind> <size>` runs
+// exactly one (system, size) measurement in a fresh process with nothing
+// else ever having touched this CUDA context; the driver script
+// (docs/research or a shell loop) invokes this repeatedly instead of
+// relying on the single-process sweep below, which is kept only as a
+// quick-look default for interactive use, not for numbers that get
+// published.
+static int run_pair(const char* kind, int S) {
+    if (strcmp(kind, "cublas") == 0) {
+        cuInit(0);
+        cublasHandle_t h;
+        if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) { fprintf(stderr, "cublasCreate failed\n"); return 1; }
+        double ms = bench_cublas(S, S, S, h);
+        printf("cublas,%d,%d,%d,%.4f\n", S, S, S, ms);
+        cublasDestroy(h);
+    } else if (strcmp(kind, "minixla_cpu") == 0) {
+        double ms = bench_minixla_cpu(S, S, S);
+        printf("minixla_cpu,%d,%d,%d,%.4f\n", S, S, S, ms);
+    } else if (strcmp(kind, "minixla_gpu") == 0 || strcmp(kind, "minixla_gpu_matmul_only") == 0) {
+        cuInit(0);
+        GpuCtx* ctx = gpu_ctx_create();
+        if (!ctx) { fprintf(stderr, "gpu_ctx_create failed\n"); return 1; }
+        double ms = strcmp(kind, "minixla_gpu") == 0
+            ? bench_minixla_gpu(S, S, S, ctx)
+            : bench_minixla_gpu_matmul_only(S, S, S, ctx);
+        printf("%s,%d,%d,%d,%.4f\n", kind, S, S, S, ms);
+        gpu_ctx_destroy(ctx);
+    } else {
+        fprintf(stderr, "unknown kind: %s\n", kind);
+        return 1;
+    }
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 4 && strcmp(argv[1], "--pair") == 0)
+        return run_pair(argv[2], atoi(argv[3]));
+
     int sizes[] = {128, 256, 512, 1024, 2048};
     int n_sizes = (int)(sizeof(sizes) / sizeof(sizes[0]));
     int cpu_cap = 1024;   // skip CPU matmul above this -- O(n^3) triple loop, minutes otherwise
