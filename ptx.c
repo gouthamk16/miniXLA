@@ -315,34 +315,45 @@ char* emit_ptx_blocked(const Node* fused) {
 char* emit_ptx(const Node* fused) { return emit_ptx_blocked(fused); }
 
 // ---- TF32 tensor-core kernel (docs/research/tensorcore-and-fusion.md) ----
-// One warp (32 threads) per block computes one 16x8 output tile via a chain
-// of mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32, accumulating over
-// K in steps of 8. No shared memory: every k-step's A/B fragment elements
-// are read straight from global memory, converted f32->tf32 with
-// cvt.rna.tf32.f32 (RNA: keeps more mantissa than RZ, confirmed against the
-// PTX ISA cvt reference), then fed to mma. Fragment row/col formulas below
-// are transcribed verbatim from the PTX ISA "Matrix Fragments for
-// mma.m16n8k8" section (.tf32 subsection) -- not derived, not guessed, a
-// mistake here produces plausible-looking wrong numbers rather than a
-// crash, so this is copied, not adapted.
+// TC_WARPS_M x TC_WARPS_N warps per block (8 warps = 256 threads for the
+// default 32x32 block tile) cooperatively stage one TC_BK-deep A/B slice
+// into shared memory per outer k-tile, then each warp runs its own
+// mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 against that shared
+// data instead of re-reading global memory per warp -- an earlier
+// one-warp-per-block version with no shared memory benchmarked *slower*
+// than the CUDA-core kernel because every warp's global reads were fully
+// redundant with its neighbors' (see docs/research/tensorcore-and-fusion.md
+// experiment log). Fragment row/col formulas are transcribed verbatim from
+// the PTX ISA "Matrix Fragments for mma.m16n8k8" section (.tf32
+// subsection); once staged in shared memory, a fragment element's read
+// address is just its warp's tile offset plus that same formula -- no
+// change to the formula itself.
 //
 // Register plan (non-SSA, same convention as emit_ptx_blocked):
 //   .b32  r0 M, r1 N, r2 K, r3 laneid, r4 ctaid.x, r5 ctaid.y,
 //         r6 groupID, r7 threadID_in_group, r8 blockRowBase, r9 blockColBase,
-//         r10 kk (loop var), r11-15 address-computation scratch (reused
-//         per element), r16-19 A fragment (a0..a3, tf32-in-b32),
-//         r20-21 B fragment (b0..b1, tf32-in-b32), r22-24 epilogue scratch
-//   .b64  rd0 A ptr, rd1 B ptr, rd9 out ptr, rd10.. ADD epilogue operand
-//         ptrs, rd20 address scratch (reused)
+//         r10 kk (loop var), r11 tid.x, r12 warp_id, r13 warpRow,
+//         r14 warpCol, r15 warpRowOffset, r16 warpColOffset,
+//         r17-21 cooperative-load address scratch (reused A then B),
+//         r26-29 A fragment (a0..a3, tf32-in-b32), r30-31 B fragment
+//         (b0..b1), r32-35 fragment-address scratch (reused per element:
+//         localRow, localCol, smemRow, smemIdx), r37-41 output-store
+//         address scratch (reused per output cell: localRow, localCol,
+//         globalRow, globalCol, flatIdx)
+//   .b64  rd0 A ptr, rd1 B ptr, rd2 As shared base, rd3 Bs shared base,
+//         rd9 out ptr, rd10.. ADD epilogue operand ptrs, rd20 address
+//         scratch (reused)
 //   .f32  f0-3 accumulator (c0..c3, doubles as mma's C and D operand list
-//         across k-steps), f4-7 raw f32 scratch before tf32 conversion,
-//         f8 zero (relu), f9 bias (add epilogue)
-//   .pred p0 k-loop test, p1-3 load boundary (reused per element),
-//         p4-6 store/epilogue boundary (reused per output cell)
+//         across k-steps and across k-tiles), f4 scratch (cooperative
+//         load and raw value before tf32 conversion, reused), f5 zero
+//         (relu), f6 bias (add epilogue)
+//   .pred p0 k-loop test, p1-3 reused across cooperative-load boundary (A
+//         then B) and output-store boundary
 char* emit_ptx_tensorcore(const Node* fused) {
     Buf b = {0};
-    const int F_ACC = 0, F_RAW = 4, F_ZERO = 8, F_BIAS = 9;
-    const int R_A = 16, R_B = 20;
+    const int F_ACC = 0, F_RAW = 4, F_ZERO = 5, F_BIAS = 6;
+    const int R_A = 26, R_B = 30;
+    const int A_ELEMS = TC_BM * TC_BK, B_ELEMS = TC_BK * TC_BN;
 
     int n_add = 0;
     for (int i = 0; i < fused->n_epilogue; i++)
@@ -364,10 +375,13 @@ char* emit_ptx_tensorcore(const Node* fused) {
         "    .param .u32 p_K\n"
         ")\n"
         "{\n"
-        "    .reg .f32  %%f<10>;\n"
-        "    .reg .b32  %%r<25>;\n"
+        "    .reg .f32  %%f<7>;\n"
+        "    .reg .b32  %%r<42>;\n"
         "    .reg .b64  %%rd<21>;\n"
-        "    .reg .pred %%p<7>;\n\n");
+        "    .reg .pred %%p<4>;\n"
+        "    .shared .align 16 .b8 As[%d];\n"
+        "    .shared .align 16 .b8 Bs[%d];\n\n",
+        A_ELEMS * 4, B_ELEMS * 4);
 
     bprintf(&b,
         "    ld.param.u32 %%r0, [p_M];\n"
@@ -375,14 +389,22 @@ char* emit_ptx_tensorcore(const Node* fused) {
         "    ld.param.u32 %%r2, [p_K];\n"
         "    ld.param.u64 %%rd0, [p_a];\n"
         "    ld.param.u64 %%rd1, [p_b];\n\n"
+        "    mov.u64     %%rd2, As;\n"
+        "    mov.u64     %%rd3, Bs;\n\n"
         "    mov.u32     %%r3, %%laneid;\n"
         "    mov.u32     %%r4, %%ctaid.x;\n"
         "    mov.u32     %%r5, %%ctaid.y;\n"
         "    shr.u32     %%r6, %%r3, 2;\n"       // groupID
         "    rem.u32     %%r7, %%r3, 4;\n"       // threadID_in_group
         "    mul.lo.u32  %%r8, %%r5, %d;\n"      // blockRowBase = ctaid.y*TC_BM
-        "    mul.lo.u32  %%r9, %%r4, %d;\n\n",   // blockColBase = ctaid.x*TC_BN
-        TC_BM, TC_BN);
+        "    mul.lo.u32  %%r9, %%r4, %d;\n\n"    // blockColBase = ctaid.x*TC_BN
+        "    mov.u32     %%r11, %%tid.x;\n"
+        "    shr.u32     %%r12, %%r11, 5;\n"      // warp_id = tid.x / 32
+        "    div.u32     %%r13, %%r12, %d;\n"     // warpRow = warp_id / TC_WARPS_N
+        "    rem.u32     %%r14, %%r12, %d;\n"     // warpCol = warp_id %% TC_WARPS_N
+        "    mul.lo.u32  %%r15, %%r13, 16;\n"     // warpRowOffset
+        "    mul.lo.u32  %%r16, %%r14, 8;\n\n",   // warpColOffset
+        TC_BM, TC_BN, TC_WARPS_N, TC_WARPS_N);
 
     for (int i = 0; i < 4; i++)
         bprintf(&b, "    mov.f32     %%f%d, 0f00000000;\n", F_ACC + i);
@@ -394,59 +416,119 @@ char* emit_ptx_tensorcore(const Node* fused) {
         "    setp.ge.u32 %%p0, %%r10, %%r2;\n"
         "    @%%p0 bra   TC_DONE;\n\n");
 
-    // A fragment: a0 row=groupID col=tid_in_group, a1 row=groupID+8
-    // col=tid_in_group, a2 row=groupID col=tid_in_group+4, a3
-    // row=groupID+8 col=tid_in_group+4 (PTX ISA 9.7.15.5.7, .tf32).
-    static const int a_row_off[4] = {0, 8, 0, 8};
-    static const int a_col_off[4] = {0, 0, 4, 4};
-    for (int i = 0; i < 4; i++) {
+    // Cooperative load: As[TC_BM][TC_BK] and Bs[TC_BK][TC_BN], A_ITERS/
+    // B_ITERS elements per thread per tile (each > 1 once TC_BK grew past
+    // matching TC_NTHREADS/TC_BM -- generalized the same way
+    // emit_ptx_blocked's cooperative load is, rather than assuming a 1:1
+    // thread:element mapping that only held for the first, shallower TC_BK).
+    // Out-of-bounds source elements are zero-filled, same predicated-load
+    // pattern as emit_ptx_blocked, so a ragged M/N/K doesn't need special-
+    // casing later in the fragment reads.
+    const int A_ITERS = A_ELEMS / TC_NTHREADS, B_ITERS = B_ELEMS / TC_NTHREADS;
+    for (int it = 0; it < A_ITERS; it++) {
+        const char* e = it == 0 ? "%r11" : "%r22";
+        if (it > 0) bprintf(&b, "    add.u32     %%r22, %%r11, %d;\n", it * TC_NTHREADS);
         bprintf(&b,
-            "    add.u32     %%r11, %%r6, %d;\n"   // localRow
-            "    add.u32     %%r12, %%r7, %d;\n"   // localCol
-            "    add.u32     %%r13, %%r8, %%r11;\n" // globalRow
-            "    add.u32     %%r14, %%r10, %%r12;\n" // globalCol = kk + localCol
-            "    setp.lt.u32 %%p1, %%r13, %%r0;\n"
-            "    setp.lt.u32 %%p2, %%r14, %%r2;\n"
+            "    div.u32     %%r17, %s, %d;\n"    // arow = idx / TC_BK
+            "    rem.u32     %%r18, %s, %d;\n"    // acol = idx %% TC_BK
+            "    add.u32     %%r19, %%r8, %%r17;\n"  // a globalRow
+            "    add.u32     %%r20, %%r10, %%r18;\n" // a globalCol = kk + acol
+            "    setp.lt.u32 %%p1, %%r19, %%r0;\n"
+            "    setp.lt.u32 %%p2, %%r20, %%r2;\n"
             "    and.pred    %%p3, %%p1, %%p2;\n"
-            "    mad.lo.u32  %%r15, %%r13, %%r2, %%r14;\n"
-            "    cvt.u64.u32 %%rd20, %%r15;\n"
+            "    mad.lo.u32  %%r21, %%r19, %%r2, %%r20;\n"
+            "    cvt.u64.u32 %%rd20, %%r21;\n"
             "    shl.b64     %%rd20, %%rd20, 2;\n"
             "    add.u64     %%rd20, %%rd0, %%rd20;\n"
             "    mov.f32     %%f%d, 0f00000000;\n"
             "    @%%p3 ld.global.f32 %%f%d, [%%rd20];\n"
-            "    cvt.rna.tf32.f32 %%r%d, %%f%d;\n\n",
-            a_row_off[i], a_col_off[i], F_RAW, F_RAW, R_A + i, F_RAW);
+            "    cvt.u64.u32 %%rd20, %s;\n"
+            "    shl.b64     %%rd20, %%rd20, 2;\n"
+            "    add.u64     %%rd20, %%rd2, %%rd20;\n"
+            "    st.shared.f32 [%%rd20], %%f%d;\n\n",
+            e, TC_BK, e, TC_BK, F_RAW, F_RAW, e, F_RAW);
     }
 
-    // B fragment: b0 row=tid_in_group col=groupID, b1 row=tid_in_group+4
-    // col=groupID (same section).
-    static const int b_row_off[2] = {0, 4};
-    for (int i = 0; i < 2; i++) {
+    for (int it = 0; it < B_ITERS; it++) {
+        const char* e = it == 0 ? "%r11" : "%r22";
+        if (it > 0) bprintf(&b, "    add.u32     %%r22, %%r11, %d;\n", it * TC_NTHREADS);
         bprintf(&b,
-            "    add.u32     %%r11, %%r7, %d;\n"   // localRow
-            "    add.u32     %%r13, %%r10, %%r11;\n" // globalRow = kk + localRow
-            "    add.u32     %%r14, %%r9, %%r6;\n"  // globalCol = blockColBase + groupID
-            "    setp.lt.u32 %%p1, %%r13, %%r2;\n"
-            "    setp.lt.u32 %%p2, %%r14, %%r1;\n"
+            "    div.u32     %%r17, %s, %d;\n"    // brow = idx / TC_BN
+            "    rem.u32     %%r18, %s, %d;\n"    // bcol = idx %% TC_BN
+            "    add.u32     %%r19, %%r10, %%r17;\n" // b globalRow = kk + brow
+            "    add.u32     %%r20, %%r9, %%r18;\n"  // b globalCol
+            "    setp.lt.u32 %%p1, %%r19, %%r2;\n"
+            "    setp.lt.u32 %%p2, %%r20, %%r1;\n"
             "    and.pred    %%p3, %%p1, %%p2;\n"
-            "    mad.lo.u32  %%r15, %%r13, %%r1, %%r14;\n"
-            "    cvt.u64.u32 %%rd20, %%r15;\n"
+            "    mad.lo.u32  %%r21, %%r19, %%r1, %%r20;\n"
+            "    cvt.u64.u32 %%rd20, %%r21;\n"
             "    shl.b64     %%rd20, %%rd20, 2;\n"
             "    add.u64     %%rd20, %%rd1, %%rd20;\n"
             "    mov.f32     %%f%d, 0f00000000;\n"
             "    @%%p3 ld.global.f32 %%f%d, [%%rd20];\n"
-            "    cvt.rna.tf32.f32 %%r%d, %%f%d;\n\n",
-            b_row_off[i], F_RAW, F_RAW, R_B + i, F_RAW);
+            "    cvt.u64.u32 %%rd20, %s;\n"
+            "    shl.b64     %%rd20, %%rd20, 2;\n"
+            "    add.u64     %%rd20, %%rd3, %%rd20;\n"
+            "    st.shared.f32 [%%rd20], %%f%d;\n\n",
+            e, TC_BN, e, TC_BN, F_RAW, F_RAW, e, F_RAW);
+    }
+
+    bprintf(&b, "    bar.sync    0;\n\n");
+
+    // Inner k-substep loop: TC_BK/8 mma steps against the shared-memory
+    // tile staged above, before the next outer iteration reloads it. A
+    // fragment: a0 row=groupID col=tid_in_group, a1 row=groupID+8
+    // col=tid_in_group, a2 row=groupID col=tid_in_group+4, a3 row=groupID+8
+    // col=tid_in_group+4 (PTX ISA 9.7.15.5.7, .tf32) -- plus ksub added to
+    // the column (the K-offset within this shared-memory tile). B
+    // fragment: b0 row=tid_in_group col=groupID, b1 row=tid_in_group+4
+    // col=groupID, plus ksub added to the row. localCol/localRow are
+    // register values (threadID_in_group/groupID + a compile-time offset),
+    // not compile-time constants -- computed explicitly, not folded into
+    // the mad immediate.
+    static const int a_row_off[4] = {0, 8, 0, 8};
+    static const int a_col_off[4] = {0, 0, 4, 4};
+    static const int b_row_off[2] = {0, 4};
+    for (int ksub = 0; ksub < TC_BK; ksub += 8) {
+        for (int i = 0; i < 4; i++) {
+            bprintf(&b,
+                "    add.u32     %%r32, %%r6, %d;\n"       // localRow = groupID + off
+                "    add.u32     %%r32, %%r32, %%r15;\n"    // smemRow = localRow + warpRowOffset
+                "    add.u32     %%r33, %%r7, %d;\n"        // smemCol = threadID_in_group + off
+                "    add.u32     %%r33, %%r33, %d;\n"        // + ksub
+                "    mad.lo.u32  %%r35, %%r32, %d, %%r33;\n" // smem idx = smemRow*TC_BK + smemCol
+                "    cvt.u64.u32 %%rd20, %%r35;\n"
+                "    shl.b64     %%rd20, %%rd20, 2;\n"
+                "    add.u64     %%rd20, %%rd2, %%rd20;\n"
+                "    ld.shared.f32 %%f%d, [%%rd20];\n"
+                "    cvt.rna.tf32.f32 %%r%d, %%f%d;\n\n",
+                a_row_off[i], a_col_off[i], ksub, TC_BK, F_RAW, R_A + i, F_RAW);
+        }
+
+        for (int i = 0; i < 2; i++) {
+            bprintf(&b,
+                "    add.u32     %%r32, %%r7, %d;\n"        // smemRow = threadID_in_group + off
+                "    add.u32     %%r32, %%r32, %d;\n"        // + ksub
+                "    add.u32     %%r33, %%r6, %%r16;\n"      // smemCol = groupID + warpColOffset
+                "    mad.lo.u32  %%r35, %%r32, %d, %%r33;\n" // smem idx = smemRow*TC_BN + smemCol
+                "    cvt.u64.u32 %%rd20, %%r35;\n"
+                "    shl.b64     %%rd20, %%rd20, 2;\n"
+                "    add.u64     %%rd20, %%rd3, %%rd20;\n"
+                "    ld.shared.f32 %%f%d, [%%rd20];\n"
+                "    cvt.rna.tf32.f32 %%r%d, %%f%d;\n\n",
+                b_row_off[i], ksub, TC_BN, F_RAW, R_B + i, F_RAW);
+        }
+
+        bprintf(&b,
+            "    mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+            "{%%f%d,%%f%d,%%f%d,%%f%d}, {%%r%d,%%r%d,%%r%d,%%r%d}, {%%r%d,%%r%d}, {%%f%d,%%f%d,%%f%d,%%f%d};\n\n",
+            F_ACC, F_ACC+1, F_ACC+2, F_ACC+3,
+            R_A, R_A+1, R_A+2, R_A+3, R_B, R_B+1,
+            F_ACC, F_ACC+1, F_ACC+2, F_ACC+3);
     }
 
     bprintf(&b,
-        "    mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
-        "{%%f%d,%%f%d,%%f%d,%%f%d}, {%%r%d,%%r%d,%%r%d,%%r%d}, {%%r%d,%%r%d}, {%%f%d,%%f%d,%%f%d,%%f%d};\n\n",
-        F_ACC, F_ACC+1, F_ACC+2, F_ACC+3,
-        R_A, R_A+1, R_A+2, R_A+3, R_B, R_B+1,
-        F_ACC, F_ACC+1, F_ACC+2, F_ACC+3);
-
-    bprintf(&b,
+        "    bar.sync    0;\n"    // compute must finish reading shared mem before next iter overwrites it
         "    add.u32     %%r10, %%r10, %d;\n"
         "    bra         TC_LOOP;\n"
         "TC_DONE:\n\n",
@@ -454,7 +536,9 @@ char* emit_ptx_tensorcore(const Node* fused) {
 
     // Epilogue + store. C/D fragment: c0 row=groupID col=2*tid_in_group,
     // c1 row=groupID col=2*tid_in_group+1, c2 row=groupID+8
-    // col=2*tid_in_group, c3 row=groupID+8 col=2*tid_in_group+1.
+    // col=2*tid_in_group, c3 row=groupID+8 col=2*tid_in_group+1 -- plus
+    // this warp's block-local offset (warpRowOffset/warpColOffset) and the
+    // block's own global offset (blockRowBase/blockColBase).
     bprintf(&b, "    ld.param.u64 %%rd9, [p_out];\n");
     for (int i = 0; i < n_add; i++)
         bprintf(&b, "    ld.param.u64 %%rd%d, [p_op%d];\n", 10 + i, i);
@@ -465,26 +549,28 @@ char* emit_ptx_tensorcore(const Node* fused) {
     for (int i = 0; i < 4; i++) {
         int acc = F_ACC + i;
         bprintf(&b,
-            "    add.u32     %%r22, %%r6, %d;\n"          // localRow
-            "    mul.lo.u32  %%r23, %%r7, 2;\n"
-            "    add.u32     %%r23, %%r23, %d;\n"          // localCol
-            "    add.u32     %%r22, %%r8, %%r22;\n"        // globalRow
-            "    add.u32     %%r23, %%r9, %%r23;\n"        // globalCol
-            "    setp.lt.u32 %%p4, %%r22, %%r0;\n"
-            "    setp.lt.u32 %%p5, %%r23, %%r1;\n"
-            "    and.pred    %%p6, %%p4, %%p5;\n"
-            "    mad.lo.u32  %%r24, %%r22, %%r1, %%r23;\n",
+            "    add.u32     %%r37, %%r6, %d;\n"         // localRow
+            "    add.u32     %%r37, %%r37, %%r15;\n"      // + warpRowOffset
+            "    add.u32     %%r39, %%r8, %%r37;\n"       // globalRow
+            "    mul.lo.u32  %%r38, %%r7, 2;\n"
+            "    add.u32     %%r38, %%r38, %d;\n"         // localCol
+            "    add.u32     %%r38, %%r38, %%r16;\n"      // + warpColOffset
+            "    add.u32     %%r40, %%r9, %%r38;\n"       // globalCol
+            "    setp.lt.u32 %%p1, %%r39, %%r0;\n"
+            "    setp.lt.u32 %%p2, %%r40, %%r1;\n"
+            "    and.pred    %%p3, %%p1, %%p2;\n"
+            "    mad.lo.u32  %%r41, %%r39, %%r1, %%r40;\n",
             c_row_off[i], c_col_off[i]);
 
         int add_idx = 0;
         for (int e = 0; e < fused->n_epilogue; e++) {
             if (fused->epilogue[e].op == OP_ADD) {
                 bprintf(&b,
-                    "    cvt.u64.u32 %%rd20, %%r24;\n"
+                    "    cvt.u64.u32 %%rd20, %%r41;\n"
                     "    shl.b64     %%rd20, %%rd20, 2;\n"
                     "    add.u64     %%rd20, %%rd%d, %%rd20;\n"
                     "    mov.f32     %%f%d, 0f00000000;\n"
-                    "    @%%p6 ld.global.f32 %%f%d, [%%rd20];\n"
+                    "    @%%p3 ld.global.f32 %%f%d, [%%rd20];\n"
                     "    add.f32     %%f%d, %%f%d, %%f%d;\n",
                     10 + add_idx, F_BIAS, F_BIAS, acc, acc, F_BIAS);
                 add_idx++;
@@ -497,10 +583,10 @@ char* emit_ptx_tensorcore(const Node* fused) {
         }
 
         bprintf(&b,
-            "    cvt.u64.u32 %%rd20, %%r24;\n"
+            "    cvt.u64.u32 %%rd20, %%r41;\n"
             "    shl.b64     %%rd20, %%rd20, 2;\n"
             "    add.u64     %%rd20, %%rd9, %%rd20;\n"
-            "    @%%p6 st.global.f32 [%%rd20], %%f%d;\n\n",
+            "    @%%p3 st.global.f32 [%%rd20], %%f%d;\n\n",
             acc);
     }
 

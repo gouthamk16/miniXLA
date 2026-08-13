@@ -103,6 +103,26 @@ static double bench_minixla_gpu_matmul_only(int M, int K, int N, GpuCtx* ctx) {
     return ms;
 }
 
+// ---- MiniXLA GPU: TF32 tensor-core kernel, matmul only (docs/research/
+// tensorcore-and-fusion.md). Same isolation/timing contract as
+// bench_minixla_gpu_matmul_only, additive kernel path.
+
+static double bench_minixla_gpu_tc_matmul_only(int M, int K, int N, GpuCtx* ctx) {
+    unsigned seed = 24680 + M * 7 + K * 13 + N * 17;
+    float* ad = rand_buf(M * K, &seed);
+    float* bd = rand_buf(K * N, &seed);
+    Tensor* ta = create_tensor(ad, (int[]){M, K}, 2);
+    Tensor* tb = create_tensor(bd, (int[]){K, N}, 2);
+    free(ad); free(bd);
+
+    Node* root = fused_node(input_node(ta), input_node(tb), NULL, 0);
+    double ms = gpu_time_kernel_tc_ms(root, ctx, WARMUP, REPS);
+
+    free_graph(root);
+    free_tensor(ta); free_tensor(tb);
+    return ms;
+}
+
 // ---- cuBLAS: raw sgemm (matmul only, no bias/relu epilogue -- cuBLAS'
 // plain Sgemm doesn't fuse one; that's exactly the comparison point) ----
 
@@ -211,13 +231,14 @@ static int run_pair(const char* kind, int S) {
     } else if (strcmp(kind, "minixla_cpu") == 0) {
         double ms = bench_minixla_cpu(S, S, S);
         printf("minixla_cpu,%d,%d,%d,%.4f\n", S, S, S, ms);
-    } else if (strcmp(kind, "minixla_gpu") == 0 || strcmp(kind, "minixla_gpu_matmul_only") == 0) {
+    } else if (strcmp(kind, "minixla_gpu") == 0 || strcmp(kind, "minixla_gpu_matmul_only") == 0 ||
+               strcmp(kind, "minixla_gpu_tc_matmul_only") == 0) {
         cuInit(0);
         GpuCtx* ctx = gpu_ctx_create();
         if (!ctx) { fprintf(stderr, "gpu_ctx_create failed\n"); return 1; }
-        double ms = strcmp(kind, "minixla_gpu") == 0
-            ? bench_minixla_gpu(S, S, S, ctx)
-            : bench_minixla_gpu_matmul_only(S, S, S, ctx);
+        double ms = strcmp(kind, "minixla_gpu") == 0 ? bench_minixla_gpu(S, S, S, ctx)
+            : strcmp(kind, "minixla_gpu_matmul_only") == 0 ? bench_minixla_gpu_matmul_only(S, S, S, ctx)
+            : bench_minixla_gpu_tc_matmul_only(S, S, S, ctx);
         printf("%s,%d,%d,%d,%.4f\n", kind, S, S, S, ms);
         gpu_ctx_destroy(ctx);
     } else {

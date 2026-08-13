@@ -30,10 +30,18 @@ char* emit_ptx(const Node* fused);
 // correctness-first with a wide-open follow-up (shared-memory blocking for
 // warp reuse) rather than trying to land both at once. Additive: does not
 // replace emit_ptx_blocked, which stays the default for every other caller.
-#define TC_BM 16
-#define TC_BN 8
+// Block tile is TC_BM x TC_BN, covered by (TC_BM/16) x (TC_BN/8) warps (2x4
+// = 8 warps = 256 threads) that share one shared-memory-resident TC_BK-deep
+// A/B slice per outer k-tile instead of each warp reading its own from
+// global memory -- the naive per-warp-only version's global traffic was
+// redundant across every warp in a block, which is why it benchmarked
+// slower than the CUDA-core kernel despite using tensor cores.
+#define TC_BM 32
+#define TC_BN 32
 #define TC_BK 8
-#define TC_NTHREADS 32
+#define TC_WARPS_M (TC_BM / 16)
+#define TC_WARPS_N (TC_BN / 8)
+#define TC_NTHREADS (TC_WARPS_M * TC_WARPS_N * 32)
 
 char* emit_ptx_tensorcore(const Node* fused);
 
