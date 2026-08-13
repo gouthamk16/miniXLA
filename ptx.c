@@ -109,7 +109,7 @@ char* emit_ptx_blocked(const Node* fused) {
     bprintf(&b,
         "    mov.u64     %%rd2, As;\n"
         "    mov.u64     %%rd3, Bs;\n"
-        "    mul.lo.u32  %%r17, %%r6, %d;\n"     // rowOff_A = threadRow*(TM*BK)
+        "    mul.lo.u32  %%r17, %%r6, %d;\n"     // rowOff_A = threadRow*TM (As is stored transposed: [k][m])
         "    cvt.u64.u32 %%rd50, %%r17;\n"
         "    shl.b64     %%rd50, %%rd50, 2;\n"
         "    add.u64     %%rd7, %%rd2, %%rd50;\n" // As read base
@@ -117,7 +117,7 @@ char* emit_ptx_blocked(const Node* fused) {
         "    cvt.u64.u32 %%rd51, %%r18;\n"
         "    shl.b64     %%rd51, %%rd51, 2;\n"
         "    add.u64     %%rd8, %%rd3, %%rd51;\n\n", // Bs read base
-        TM * BK, TN);
+        TM, TN);
 
     // ---- accumulators ----
     for (int i = 0; i < TM * TN; i++)
@@ -131,7 +131,12 @@ char* emit_ptx_blocked(const Node* fused) {
         "    setp.ge.u32 %%p0, %%r10, %%r2;\n"
         "    @%%p0 bra   TILE_DONE;\n\n");
 
-    // Cooperative load of As[BM][BK] from A[rowBase.., kTile..]
+    // Cooperative load of As from A[rowBase.., kTile..], stored TRANSPOSED
+    // in shared memory as As[k][m] (not As[m][k]) -- this is what makes the
+    // regM read below a single contiguous ld.shared.v4.f32 instead of 4
+    // strided scalar loads (see docs/research/gemm-optimization.md): for a
+    // fixed kk, the TM values across i=0..TM-1 are BM*4 bytes apart in the
+    // natural [m][k] layout but 4 bytes apart (contiguous) in [k][m].
     for (int it = 0; it < A_ITERS; it++) {
         const char* e = it == 0 ? "%r3" : "%r11";
         if (it > 0) bprintf(&b, "    add.u32     %%r11, %%r3, %d;\n", it * NTHREADS);
@@ -149,11 +154,12 @@ char* emit_ptx_blocked(const Node* fused) {
             "    add.u64     %%rd6, %%rd0, %%rd6;\n"
             "    mov.f32     %%f30, 0f00000000;\n"
             "    @%%p3 ld.global.f32 %%f30, [%%rd6];\n"
-            "    cvt.u64.u32 %%rd4, %s;\n"
+            "    mad.lo.u32  %%r16, %%r13, %d, %%r12;\n" // writeIdx = acol*BM + arow (transposed)
+            "    cvt.u64.u32 %%rd4, %%r16;\n"
             "    shl.b64     %%rd4, %%rd4, 2;\n"
             "    add.u64     %%rd4, %%rd2, %%rd4;\n"
             "    st.shared.f32 [%%rd4], %%f30;\n\n",
-            e, BK, e, BK, e);
+            e, BK, e, BK, BM);
     }
 
     // Cooperative load of Bs[BK][BN] from B[kTile.., colBase..]
@@ -184,11 +190,27 @@ char* emit_ptx_blocked(const Node* fused) {
     bprintf(&b, "    bar.sync    0;\n\n");
 
     // ---- compute: unrolled kk = 0..BK-1 ----
+    // regM/regN loads are vectorized (ld.shared.v4.f32, one instruction for
+    // all TM/TN values instead of TM/TN scalar loads) when TM==TN==4 -- the
+    // only per-thread tile size this emitter currently generates. As is
+    // stored transposed specifically so this regM load is contiguous (see
+    // the cooperative-load comment above); regN's is contiguous in B's
+    // natural layout already. Falls back to scalar loads if that ever
+    // changes, so a future TM/TN tweak fails to compile cleanly rather than
+    // silently emitting a wrong vector load.
     for (int kk = 0; kk < BK; kk++) {
-        for (int i = 0; i < TM; i++)
-            bprintf(&b, "    ld.shared.f32 %%f%d, [%%rd7+%d];\n", 16 + i, (i * BK + kk) * 4);
-        for (int j = 0; j < TN; j++)
-            bprintf(&b, "    ld.shared.f32 %%f%d, [%%rd8+%d];\n", 20 + j, (kk * BN + j) * 4);
+        if (TM == 4) {
+            bprintf(&b, "    ld.shared.v4.f32 {%%f16,%%f17,%%f18,%%f19}, [%%rd7+%d];\n", kk * BM * 4);
+        } else {
+            for (int i = 0; i < TM; i++)
+                bprintf(&b, "    ld.shared.f32 %%f%d, [%%rd7+%d];\n", 16 + i, (kk * BM + i) * 4);
+        }
+        if (TN == 4) {
+            bprintf(&b, "    ld.shared.v4.f32 {%%f20,%%f21,%%f22,%%f23}, [%%rd8+%d];\n", kk * BN * 4);
+        } else {
+            for (int j = 0; j < TN; j++)
+                bprintf(&b, "    ld.shared.f32 %%f%d, [%%rd8+%d];\n", 20 + j, (kk * BN + j) * 4);
+        }
         for (int i = 0; i < TM; i++)
             for (int j = 0; j < TN; j++)
                 bprintf(&b, "    fma.rn.f32  %%f%d, %%f%d, %%f%d, %%f%d;\n",
