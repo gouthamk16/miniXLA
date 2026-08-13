@@ -14,6 +14,34 @@ where MiniXLA is far behind.
 The phase roadmap and unfinished ideas live in [`idea.md`](idea.md). This
 README is what actually exists.
 
+## Benchmarks
+
+A hand-written PTX kernel, on an RTX 4060 Laptop GPU, measured process-isolated
+against `cublasSgemm` and PyTorch eager — no cherry-picking, methodology in
+full in [the report](docs/bench_report.html):
+
+| Size | cuBLAS (GFLOPS) | PyTorch | MiniXLA GPU | % of cuBLAS |
+|---|---:|---:|---:|---:|
+| 128×128 | 582 | 256 (43.9%) | 108 | 18.5% |
+| 256×256 | 2,523 | 1,491 (59.1%) | 537 | 21.3% |
+| 512×512 | 5,046 | 4,372 (86.7%) | 2,222 | 44.0% |
+| 1024×1024 | 8,052 | 6,337 (78.7%) | 5,256 | 65.3% |
+| 2048×2048 | 6,940 | 6,910 (99.6%) | 5,849 | **84.3%** |
+
+That 2048×2048 number was 12.9% of cuBLAS at the start of one session. Getting
+it to 84.3% took two separate things, both written up honestly, mistakes
+included: a [research pass](docs/research/gemm-optimization.md) that took the
+kernel itself from a naive shared-memory tile to 2D register blocking +
+vectorized SMEM reads (4.1× faster, run as an autonomous
+[autoresearch](docs/research/autoresearch-gemm.md) loop — one hypothesis per
+commit, correctness-gated against the CPU reference, kept or reverted, no
+hand-holding) — and finding a reproducible cross-process benchmarking bug
+that had been *inflating* the measured gap the whole time. cuBLAS still wins
+because it's routing through TF32 tensor cores on this GPU by default and
+MiniXLA is still CUDA cores only — [siboehm's worklog](https://siboehm.com/articles/22/CUDA-MMM)
+says 93.7% of cuBLAS is reachable on CUDA cores alone; that's the next lever,
+not a wall.
+
 ## Pipeline
 
 ```
