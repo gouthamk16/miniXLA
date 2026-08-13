@@ -47,7 +47,13 @@ static double minv(double* v, int n) {
     return m;
 }
 
-// ---- MiniXLA GPU: fused relu(matmul(a,b)+bias), autotuned tile ----
+// ---- MiniXLA GPU: fused relu(matmul(a,b)+bias) ----
+// Kernel-only timing (gpu_time_kernel_ms: upload once, time the launch
+// alone) -- the fair comparison point against cublasSgemm's own methodology
+// below. An earlier version of this function timed gpu_execute in a loop
+// instead, which re-uploads its inputs on every call; that measured upload+
+// compute+download against cuBLAS's compute-only number, understating
+// MiniXLA's actual kernel throughput. See docs/research/gemm-optimization.md.
 
 static double bench_minixla_gpu(int M, int K, int N, GpuCtx* ctx) {
     unsigned seed = 12345 + M * 7 + K * 13 + N * 17;
@@ -60,40 +66,17 @@ static double bench_minixla_gpu(int M, int K, int N, GpuCtx* ctx) {
     free(ad); free(bd); free(cd);
 
     Node* root = optimize(g_relu(g_add(g_matmul(input_node(ta), input_node(tb)), input_node(tc))));
-    // No execute(root) here: gpu_autotune/gpu_execute only need the direct
-    // OP_INPUT operands' ->output (already set at construction time), and
-    // correctness is already exhaustively covered by gpu_test.c -- calling
-    // the CPU path here would just burn O(M*K*N) time on the slow
-    // triple-loop matmul for no benefit at the larger sizes.
-
-    gpu_autotune(root, ctx);   // picks the best tile for this exact shape/epilogue
-
-    for (int i = 0; i < WARMUP; i++) { Tensor* r = gpu_execute(root, ctx); free_tensor(r); }
-
-    CUevent t0, t1;
-    cuEventCreate(&t0, CU_EVENT_DEFAULT);
-    cuEventCreate(&t1, CU_EVENT_DEFAULT);
-    double samples[REPS];
-    for (int i = 0; i < REPS; i++) {
-        cuEventRecord(t0, 0);
-        Tensor* r = gpu_execute(root, ctx);
-        cuEventRecord(t1, 0);
-        cuEventSynchronize(t1);
-        float ms; cuEventElapsedTime(&ms, t0, t1);
-        samples[i] = ms;
-        free_tensor(r);
-    }
-    cuEventDestroy(t0); cuEventDestroy(t1);
+    double ms = gpu_time_kernel_ms(root, ctx, WARMUP, REPS);
 
     free_graph(root);
     free_tensor(ta); free_tensor(tb); free_tensor(tc);
-    return minv(samples, REPS);
+    return ms;
 }
 
 // ---- MiniXLA GPU: matmul only, no epilogue (fused_node built directly --
 // optimize() never fuses a bare matmul with no elementwise consumer, so
-// this bypasses the optimizer rather than going through it). Same tiled
-// kernel infrastructure as bench_minixla_gpu, isolating what the add+relu
+// this bypasses the optimizer rather than going through it). Same kernel
+// infrastructure as bench_minixla_gpu, isolating what the add+relu
 // epilogue costs on top of the matmul the two share, independent of how
 // MiniXLA's raw matmul compares to cuBLAS's.
 
@@ -106,28 +89,11 @@ static double bench_minixla_gpu_matmul_only(int M, int K, int N, GpuCtx* ctx) {
     free(ad); free(bd);
 
     Node* root = fused_node(input_node(ta), input_node(tb), NULL, 0);
-    gpu_autotune(root, ctx);
-
-    for (int i = 0; i < WARMUP; i++) { Tensor* r = gpu_execute(root, ctx); free_tensor(r); }
-
-    CUevent t0, t1;
-    cuEventCreate(&t0, CU_EVENT_DEFAULT);
-    cuEventCreate(&t1, CU_EVENT_DEFAULT);
-    double samples[REPS];
-    for (int i = 0; i < REPS; i++) {
-        cuEventRecord(t0, 0);
-        Tensor* r = gpu_execute(root, ctx);
-        cuEventRecord(t1, 0);
-        cuEventSynchronize(t1);
-        float ms; cuEventElapsedTime(&ms, t0, t1);
-        samples[i] = ms;
-        free_tensor(r);
-    }
-    cuEventDestroy(t0); cuEventDestroy(t1);
+    double ms = gpu_time_kernel_ms(root, ctx, WARMUP, REPS);
 
     free_graph(root);
     free_tensor(ta); free_tensor(tb);
-    return minv(samples, REPS);
+    return ms;
 }
 
 // ---- cuBLAS: raw sgemm (matmul only, no bias/relu epilogue -- cuBLAS'

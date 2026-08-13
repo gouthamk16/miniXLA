@@ -248,47 +248,6 @@ static void test_deep_chain(void) {
     printf("test_deep_chain PASS\n");
 }
 
-// ---- Test 3: autotuner — picks best tile, subsequent execute uses it ----
-
-static void test_autotune(void) {
-    const int S = 256;
-    float* ad = malloc(S * S * sizeof(float));
-    float* bd = malloc(S * S * sizeof(float));
-    float* cd = malloc(S * S * sizeof(float));
-    for (int i = 0; i < S * S; i++) {
-        ad[i] = (float)(i % 7) * 0.01f;
-        bd[i] = (float)(i % 11) * 0.01f - 0.05f;
-        cd[i] = (float)(i % 5) * 0.02f;
-    }
-    Tensor* ta = create_tensor(ad, (int[]){S, S}, 2);
-    Tensor* tb = create_tensor(bd, (int[]){S, S}, 2);
-    Tensor* tc = create_tensor(cd, (int[]){S, S}, 2);
-
-    Node* root = optimize(g_relu(g_add(g_matmul(input_node(ta),
-                                                 input_node(tb)),
-                                       input_node(tc))));
-    assert(root->op == OP_FUSED);
-    Tensor* cpu_out = execute(root);
-
-    GpuCtx* ctx = gpu_ctx_create();
-    assert(ctx);
-
-    printf("autotune 256x256 relu(matmul+add):\n");
-    int best = gpu_autotune(root, ctx);
-    assert(best == 8 || best == 16 || best == 32);
-
-    // Execute using the tuned tile
-    Tensor* gpu_out = gpu_execute(root, ctx);
-    assert(gpu_out && approx_tensors(cpu_out, gpu_out, 1e-3f));
-    free_tensor(gpu_out);
-
-    gpu_ctx_destroy(ctx);
-    free_graph(root);
-    free_tensor(ta); free_tensor(tb); free_tensor(tc);
-    free(ad); free(bd); free(cd);
-    printf("test_autotune PASS (best tile = %d)\n", best);
-}
-
 // ---- Test 4: module cache — same graph executed twice, results agree ----
 // The second run reuses the compiled CUmodule instead of re-JIT-ing.
 
@@ -381,7 +340,6 @@ int main(void) {
     test_diamond_shared_input();
     test_two_layer();
     test_deep_chain();
-    test_autotune();
     test_module_cache();
     bench_large_matmul();
     printf("all gpu tests PASS\n");

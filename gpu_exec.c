@@ -52,26 +52,12 @@ static void cache_insert(ModCache* c, char* ptx_owned, CUmodule mod) {
     c->data[c->count++] = (CacheEntry){ptx_owned, mod};
 }
 
-// ---- Tile-size map (epilogue signature → optimal tile) ----
-
-typedef struct { char ep_key[32]; int tile; } TuneEntry;
-
-// Epilogue key: compact string encoding op sequence, e.g. "AR" = ADD,RELU.
-static void ep_key_str(const Node* n, char key[32]) {
-    int i = 0;
-    for (int e = 0; e < n->n_epilogue && i < 31; e++)
-        key[i++] = (n->epilogue[e].op == OP_ADD) ? 'A' : 'R';
-    key[i] = 0;
-}
-
 // ---- GpuCtx ----
 
 struct GpuCtx {
     CUdevice  dev;
     CUcontext ctx;
     ModCache  mod_cache;
-    TuneEntry tune[32];
-    int       n_tune;
 };
 
 static int cu_check(CUresult r, const char* label) {
@@ -115,20 +101,13 @@ static void node_dims(const Node* n, int* rows, int* cols) {
     node_dims(n->inputs[1], &k2, cols);
 }
 
-// ---- Tile lookup (returns PTX_TILE if not autotuned) ----
+// ---- Shared: build + launch a fused kernel ----
+// Launch config is fixed by the kernel's own tiling (GEMM_BM/BN/NTHREADS,
+// ptx.h) rather than a runtime tile parameter -- see the Phase-7-successor
+// GEMM optimization design doc. Autotuning over (BM,BN,BK,TM,TN)
+// combinations is documented future work, not implemented yet.
 
-static int tile_for(const GpuCtx* g, const Node* nd) {
-    char key[32];
-    ep_key_str(nd, key);
-    for (int i = 0; i < g->n_tune; i++)
-        if (strcmp(g->tune[i].ep_key, key) == 0) return g->tune[i].tile;
-    return PTX_TILE;
-}
-
-// ---- Shared: build + launch a fused kernel (used by both execute and autotune) ----
-
-static CUresult launch_fused(CUfunction fn, int tile,
-                              int M, int N, int K,
+static CUresult launch_fused(CUfunction fn, int M, int N, int K,
                               CUdeviceptr d_a, CUdeviceptr d_b,
                               CUdeviceptr* op_ptrs, int n_add,
                               CUdeviceptr d_out) {
@@ -149,26 +128,19 @@ static CUresult launch_fused(CUfunction fn, int tile,
     params[pi++] = &uN;
     params[pi++] = &uK;
 
-    unsigned gx = ((unsigned)N + tile - 1) / tile;
-    unsigned gy = ((unsigned)M + tile - 1) / tile;
-    CUresult r = cuLaunchKernel(fn, gx, gy, 1, tile, tile, 1, 0, 0, params, NULL);
+    unsigned gx = ((unsigned)N + GEMM_BN - 1) / GEMM_BN;
+    unsigned gy = ((unsigned)M + GEMM_BM - 1) / GEMM_BM;
+    CUresult r = cuLaunchKernel(fn, gx, gy, 1, GEMM_NTHREADS, 1, 1, 0, 0, params, NULL);
     free(params);
     free(op_copy);
     return r;
 }
 
-// ---- gpu_autotune ----
+// ---- gpu_time_kernel_ms ----
 
-int gpu_autotune(Node* root, GpuCtx* g) {
-    if (root->op != OP_FUSED) return PTX_TILE;
-
-    char key[32];
-    ep_key_str(root, key);
-    for (int i = 0; i < g->n_tune; i++)
-        if (strcmp(g->tune[i].ep_key, key) == 0) return g->tune[i].tile;
-
-    // Require inputs to have host data available
-    if (!root->inputs[0]->output || !root->inputs[1]->output) return PTX_TILE;
+double gpu_time_kernel_ms(Node* root, GpuCtx* g, int warmup, int reps) {
+    if (root->op != OP_FUSED) return -1.0;
+    if (!root->inputs[0]->output || !root->inputs[1]->output) return -1.0;
 
     int M, K, N, dummy;
     node_dims(root->inputs[0], &M, &K);
@@ -178,89 +150,77 @@ int gpu_autotune(Node* root, GpuCtx* g) {
     for (int i = 0; i < root->n_epilogue; i++)
         if (root->epilogue[i].op == OP_ADD) n_add++;
 
-    // Upload inputs once for all tile variants
     Tensor* ta = root->inputs[0]->output;
     Tensor* tb = root->inputs[1]->output;
     CUdeviceptr d_a = 0, d_b = 0, d_out = 0;
     CUdeviceptr* d_ops = n_add ? calloc(n_add, sizeof(CUdeviceptr)) : NULL;
+    double result = -1.0;
 
-    if (!cu_check(cuMemAlloc(&d_a, ta->size * sizeof(float)), "autotune alloc a") ||
-        !cu_check(cuMemcpyHtoD(d_a, ta->data, ta->size * sizeof(float)), "autotune H2D a") ||
-        !cu_check(cuMemAlloc(&d_b, tb->size * sizeof(float)), "autotune alloc b") ||
-        !cu_check(cuMemcpyHtoD(d_b, tb->data, tb->size * sizeof(float)), "autotune H2D b") ||
-        !cu_check(cuMemAlloc(&d_out, (size_t)M * N * sizeof(float)), "autotune alloc out"))
-        goto at_cleanup;
+    if (!cu_check(cuMemAlloc(&d_a, ta->size * sizeof(float)), "time_kernel alloc a") ||
+        !cu_check(cuMemcpyHtoD(d_a, ta->data, ta->size * sizeof(float)), "time_kernel H2D a") ||
+        !cu_check(cuMemAlloc(&d_b, tb->size * sizeof(float)), "time_kernel alloc b") ||
+        !cu_check(cuMemcpyHtoD(d_b, tb->data, tb->size * sizeof(float)), "time_kernel H2D b") ||
+        !cu_check(cuMemAlloc(&d_out, (size_t)M * N * sizeof(float)), "time_kernel alloc out"))
+        goto cleanup;
 
     {
         int ai = 0;
         for (int i = 0; i < root->n_epilogue; i++) {
             if (root->epilogue[i].op != OP_ADD) continue;
             Tensor* op = root->epilogue[i].operand->output;
-            if (!cu_check(cuMemAlloc(&d_ops[ai], op->size * sizeof(float)), "autotune alloc op") ||
-                !cu_check(cuMemcpyHtoD(d_ops[ai], op->data, op->size * sizeof(float)), "autotune H2D op"))
-                goto at_cleanup;
+            if (!cu_check(cuMemAlloc(&d_ops[ai], op->size * sizeof(float)), "time_kernel alloc op") ||
+                !cu_check(cuMemcpyHtoD(d_ops[ai], op->data, op->size * sizeof(float)), "time_kernel H2D op"))
+                goto cleanup;
             ai++;
         }
     }
 
     {
-        int best_tile = PTX_TILE;
-        float best_ms = 1e30f;
-        const int TILES[] = {8, 16, 32};
-
-        for (int ti = 0; ti < 3; ti++) {
-            int tile = TILES[ti];
-            char* ptx = emit_ptx_tiled(root, tile);
-            CUmodule  mod = NULL;
-            CUfunction fn = NULL;
-            if (cuModuleLoadDataEx(&mod, ptx, 0, NULL, NULL) != CUDA_SUCCESS ||
-                cuModuleGetFunction(&fn, mod, "fused") != CUDA_SUCCESS) {
-                free(ptx); if (mod) cuModuleUnload(mod); continue;
-            }
+        char* ptx = emit_ptx_blocked(root);
+        CUmodule mod = cache_lookup(&g->mod_cache, ptx);
+        CUfunction fn = NULL;
+        if (mod) {
             free(ptx);
-
-            // 2 warmup runs
-            for (int w = 0; w < 2; w++) {
-                launch_fused(fn, tile, M, N, K, d_a, d_b, d_ops, n_add, d_out);
-                cuCtxSynchronize();
+        } else {
+            if (!cu_check(cuModuleLoadDataEx(&mod, ptx, 0, NULL, NULL), "time_kernel cuModuleLoadDataEx")) {
+                free(ptx);
+                goto cleanup;
             }
+            cache_insert(&g->mod_cache, ptx, mod);
+        }
+        if (!cu_check(cuModuleGetFunction(&fn, mod, "fused"), "time_kernel cuModuleGetFunction"))
+            goto cleanup;
 
-            // 5 timed runs — take the minimum to avoid OS jitter
-            CUevent ev0, ev1;
-            cuEventCreate(&ev0, CU_EVENT_DEFAULT);
-            cuEventCreate(&ev1, CU_EVENT_DEFAULT);
-            float min_ms = 1e30f;
-            for (int r = 0; r < 5; r++) {
-                cuEventRecord(ev0, 0);
-                launch_fused(fn, tile, M, N, K, d_a, d_b, d_ops, n_add, d_out);
-                cuEventRecord(ev1, 0);
-                cuEventSynchronize(ev1);
-                float ms; cuEventElapsedTime(&ms, ev0, ev1);
-                if (ms < min_ms) min_ms = ms;
-            }
-            cuEventDestroy(ev0); cuEventDestroy(ev1);
-
-            printf("  autotune tile=%2d: %.3f ms\n", tile, min_ms);
-            if (min_ms < best_ms) { best_ms = min_ms; best_tile = tile; }
-
-            cuModuleUnload(mod);
+        for (int w = 0; w < warmup; w++) {
+            launch_fused(fn, M, N, K, d_a, d_b, d_ops, n_add, d_out);
+            cuCtxSynchronize();
         }
 
-        if (g->n_tune < 32) {
-            strncpy(g->tune[g->n_tune].ep_key, key, 31);
-            g->tune[g->n_tune].tile = best_tile;
-            g->n_tune++;
+        CUevent t0, t1;
+        cuEventCreate(&t0, CU_EVENT_DEFAULT);
+        cuEventCreate(&t1, CU_EVENT_DEFAULT);
+        double best = 1e30;
+        for (int r = 0; r < reps; r++) {
+            cuEventRecord(t0, 0);
+            launch_fused(fn, M, N, K, d_a, d_b, d_ops, n_add, d_out);
+            cuEventRecord(t1, 0);
+            cuEventSynchronize(t1);
+            float ms; cuEventElapsedTime(&ms, t0, t1);
+            if (ms < best) best = ms;
         }
-        printf("  autotune best tile=%d (%.3f ms)\n", best_tile, best_ms);
-
-at_cleanup:
-        cuMemFree(d_a); cuMemFree(d_b); cuMemFree(d_out);
-        if (d_ops) {
-            for (int i = 0; i < n_add; i++) if (d_ops[i]) cuMemFree(d_ops[i]);
-            free(d_ops);
-        }
-        return best_tile;
+        cuEventDestroy(t0); cuEventDestroy(t1);
+        result = best;
     }
+
+cleanup:
+    if (d_a) cuMemFree(d_a);
+    if (d_b) cuMemFree(d_b);
+    if (d_out) cuMemFree(d_out);
+    if (d_ops) {
+        for (int i = 0; i < n_add; i++) if (d_ops[i]) cuMemFree(d_ops[i]);
+        free(d_ops);
+    }
+    return result;
 }
 
 // ---- gpu_execute ----
@@ -335,10 +295,7 @@ Tensor* gpu_execute(Node* root, GpuCtx* g) {
             }
             if (!ok) break;
 
-            // Use tuned tile if available, else default
-            int tile = tile_for(g, nd);
-
-            char* ptx  = emit_ptx_tiled(nd, tile);
+            char* ptx  = emit_ptx_blocked(nd);
             CUmodule  mod = cache_lookup(&g->mod_cache, ptx);
             CUfunction fn = NULL;
             if (mod) {
@@ -365,7 +322,7 @@ Tensor* gpu_execute(Node* root, GpuCtx* g) {
                 if (nd->epilogue[i].op == OP_ADD)
                     op_ptrs[ai++] = map_get(&map, nd->epilogue[i].operand);
 
-            CUresult lr = launch_fused(fn, tile, M, N, K, d_a, d_b, op_ptrs, n_add, d_out);
+            CUresult lr = launch_fused(fn, M, N, K, d_a, d_b, op_ptrs, n_add, d_out);
             free(op_ptrs);
             ok = cu_check(lr, "cuLaunchKernel");
 

@@ -95,11 +95,12 @@ Tensor* gpu_run_fused(const Node* fused, const char* ptx) {
     params[pi++] = &uN;
     params[pi++] = &uK;
 
-    // 2D launch: (TILE×TILE) block, ceil(N/TILE)×ceil(M/TILE) grid
-    unsigned grid_x = ((unsigned)N + PTX_TILE - 1) / PTX_TILE;
-    unsigned grid_y = ((unsigned)M + PTX_TILE - 1) / PTX_TILE;
+    // Launch config matches the register-blocked kernel's own tiling
+    // (GEMM_BM/BN, 1D block of GEMM_NTHREADS) -- see ptx.h.
+    unsigned grid_x = ((unsigned)N + GEMM_BN - 1) / GEMM_BN;
+    unsigned grid_y = ((unsigned)M + GEMM_BM - 1) / GEMM_BM;
     CUresult launch_r = cuLaunchKernel(fn, grid_x, grid_y, 1,
-                                       PTX_TILE, PTX_TILE, 1,
+                                       GEMM_NTHREADS, 1, 1,
                                        0, 0, params, NULL);
     free(params);
     if (!cu_check(launch_r, "cuLaunchKernel")) goto cleanup;
