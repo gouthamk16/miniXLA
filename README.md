@@ -8,7 +8,7 @@ This is a learning compiler, not a framework. The point is to see the path
 from `matmul → add → relu` to a real kernel, including the bugs that only
 show up on DAGs (shared nodes, fused epilogues) rather than straight chains.
 It is not trying to beat PyTorch or XLA. Measured kernel throughput vs
-cuBLAS is in [the benchmark report](docs/bench_report.html) — including
+cuBLAS is in [the benchmark report](docs/bench_report.html), including
 where MiniXLA is far behind.
 
 The phase roadmap and unfinished ideas live in [`idea.md`](idea.md). This
@@ -17,7 +17,7 @@ README is what actually exists.
 ## Benchmarks
 
 A hand-written PTX kernel, on an RTX 4060 Laptop GPU, measured process-isolated
-against `cublasSgemm` and PyTorch eager — no cherry-picking, methodology in
+against `cublasSgemm` and PyTorch eager, no cherry-picking, methodology in
 full in [the report](docs/bench_report.html):
 
 | Size | cuBLAS (GFLOPS) | PyTorch | MiniXLA GPU | % of cuBLAS |
@@ -28,17 +28,20 @@ full in [the report](docs/bench_report.html):
 | 1024×1024 | 8,052 | 6,337 (78.7%) | 5,256 | 65.3% |
 | 2048×2048 | 6,940 | 6,910 (99.6%) | 5,849 | **84.3%** |
 
+<img src="docs/images/chart-gflops.png" alt="GFLOPS vs matrix size, log scale: cuBLAS, PyTorch, and MiniXLA GPU" width="700">
+<img src="docs/images/chart-cpu-vs-gpu.png" alt="MiniXLA GPU vs its own naive CPU matmul, log scale, up to 557x at 1024x1024" width="700">
+
 That 2048×2048 number was 12.9% of cuBLAS at the start of one session. Getting
 it to 84.3% took two separate things, both written up honestly, mistakes
 included: a [research pass](docs/research/gemm-optimization.md) that took the
 kernel itself from a naive shared-memory tile to 2D register blocking +
 vectorized SMEM reads (4.1× faster, run as an autonomous
-[autoresearch](docs/research/autoresearch-gemm.md) loop — one hypothesis per
+[autoresearch](docs/research/autoresearch-gemm.md) loop: one hypothesis per
 commit, correctness-gated against the CPU reference, kept or reverted, no
-hand-holding) — and finding a reproducible cross-process benchmarking bug
+hand-holding), and finding a reproducible cross-process benchmarking bug
 that had been *inflating* the measured gap the whole time. cuBLAS still wins
 because it's routing through TF32 tensor cores on this GPU by default and
-MiniXLA is still CUDA cores only — [siboehm's worklog](https://siboehm.com/articles/22/CUDA-MMM)
+MiniXLA is still CUDA cores only. [siboehm's worklog](https://siboehm.com/articles/22/CUDA-MMM)
 says 93.7% of cuBLAS is reachable on CUDA cores alone; that's the next lever,
 not a wall.
 
@@ -126,7 +129,7 @@ python bench_pytorch.py
 18 CPU tests, 7 GPU tests (including a diamond DAG that caught two shipped
 bugs chain-shaped tests missed). Both suites should pass before a change to
 `graph.c`, `optimizer.c`, `tensor.c`, `ptx.c`, `runtime.c`, or `gpu_exec.c`
-is done — the two backends execute the same optimized graphs.
+is done: the two backends execute the same optimized graphs.
 
 ## Layout
 
@@ -146,10 +149,10 @@ is done — the two backends execute the same optimized graphs.
 
 ## Docs
 
-- [`docs/bench_report.html`](docs/bench_report.html) — measured vs cuBLAS and PyTorch
-- [`docs/superpowers/specs/`](docs/superpowers/specs/) — design notes per phase
-- [`docs/research/gemm-optimization.md`](docs/research/gemm-optimization.md) — kernel worklog (register blocking → vectorized loads → autotune → tensor cores)
-- [`idea.md`](idea.md) — original roadmap. Phase 8 (multi-GPU) is a design doc only: this machine has one GPU and no NCCL.
+- [`docs/bench_report.html`](docs/bench_report.html): measured vs cuBLAS and PyTorch
+- [`docs/superpowers/specs/`](docs/superpowers/specs/): design notes per phase
+- [`docs/research/gemm-optimization.md`](docs/research/gemm-optimization.md): kernel worklog (register blocking → vectorized loads → autotune → tensor cores)
+- [`idea.md`](idea.md): original roadmap. Phase 8 (multi-GPU) is a design doc only: this machine has one GPU and no NCCL.
 
 ## Status
 

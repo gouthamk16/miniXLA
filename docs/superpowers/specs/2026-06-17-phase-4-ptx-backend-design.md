@@ -1,4 +1,4 @@
-# Phase 4 — PTX Backend Design
+# Phase 4: PTX Backend Design
 
 ## Goal
 
@@ -15,7 +15,7 @@ the Phase 5 runtime forward so the kernel is numerically verified now.
 
 Confirmed on this machine (CUDA 12.6, RTX 4060, compute capability 8.9):
 
-- The **PTX emitter** has no CUDA dependency — it is pure C and builds with
+- The **PTX emitter** has no CUDA dependency: it is pure C and builds with
   gcc alongside the existing sources.
 - The **GPU runtime** uses the CUDA Driver API (`cuda.h`) and is built with
   **nvcc**, which locates MSVC, compiles the project's C99 (compound literals
@@ -110,11 +110,11 @@ graph (Phase 3 optimize) ──▶ OP_FUSED node
 
 ## Verification
 
-1. **Codegen (gcc, no GPU)** — in `tests.c`: `emit_ptx` on the optimized
+1. **Codegen (gcc, no GPU)**: in `tests.c`: `emit_ptx` on the optimized
    fused graph, write to a temp `.ptx`, run `ptxas -arch=sm_89 <file> -o <nul>`
    via `system`, assert exit 0. Also assert the text contains `.entry fused`,
    an `fma`, and a `max.f32`.
-2. **End-to-end (nvcc, GPU)** — `gpu_test.c` as described: GPU result equals
+2. **End-to-end (nvcc, GPU)**: `gpu_test.c` as described: GPU result equals
    CPU result within `1e-4`.
 
 ## Build commands
@@ -124,10 +124,10 @@ graph (Phase 3 optimize) ──▶ OP_FUSED node
 
 ## File layout
 
-- `ptx.c` / `ptx.h` — PTX emitter (pure C).
-- `runtime.c` / `runtime.h` — Driver-API runner (CUDA).
-- `gpu_test.c` — nvcc end-to-end test.
-- `tests.c` — gains the codegen / `ptxas` validation test.
+- `ptx.c` / `ptx.h`: PTX emitter (pure C).
+- `runtime.c` / `runtime.h`: Driver-API runner (CUDA).
+- `gpu_test.c`: nvcc end-to-end test.
+- `tests.c`: gains the codegen / `ptxas` validation test.
 
 ## Out of scope (later phases)
 

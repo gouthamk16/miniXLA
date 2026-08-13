@@ -1,5 +1,5 @@
 <meta charset="utf-8">
-<title>MiniXLA — Benchmark Report</title>
+<title>MiniXLA: Benchmark Report</title>
 <style>
   :root {
     color-scheme: light;
@@ -197,8 +197,8 @@
   <header class="masthead">
     <span class="eyebrow">Benchmark Report</span>
     <h1>MiniXLA: what it does, what it costs, and how far it is from cuBLAS</h1>
-    <p>A from-scratch C/CUDA/PTX ML compiler — graph optimizer, PTX code
-      generator, and GPU runtime — measured honestly against cuBLAS and
+    <p>A from-scratch C/CUDA/PTX ML compiler (graph optimizer, PTX code
+      generator, and GPU runtime), measured honestly against cuBLAS and
       PyTorch on the exact hardware it was built on, not estimated.</p>
     <div class="masthead-meta">
       <span><b>Hardware</b> NVIDIA GeForce RTX 4060 Laptop GPU, CUDA 12.6</span>
@@ -214,11 +214,11 @@
       </div>
       <div class="stat-tile">
         <div class="stat-value">84%</div>
-        <div class="stat-label">of cuBLAS at 2048³ — up from 8% at session start</div>
+        <div class="stat-label">of cuBLAS at 2048³, up from 8% at session start</div>
       </div>
       <div class="stat-tile">
         <div class="stat-value">4</div>
-        <div class="stat-label">compiler bugs found &amp; fixed (plus 2 benchmark-methodology ones — see Performance)</div>
+        <div class="stat-label">compiler bugs found &amp; fixed (plus 2 benchmark-methodology ones, see Performance)</div>
       </div>
       <div class="stat-tile">
         <div class="stat-value">557×</div>
@@ -233,11 +233,11 @@
     <p class="lede">MiniXLA takes a small tensor-op graph, rewrites it
       (constant folding, dead-node elimination, operator fusion into
       matmul+epilogue kernels), emits PTX for the fused regions, and runs it
-      through the CUDA Driver API — with module caching and last-use buffer
+      through the CUDA Driver API, with module caching and last-use buffer
       freeing. Phase 6 adds reverse-mode autodiff on top. A second pass
       (<a href="research/gemm-optimization.md">full writeup</a>) then spent a
       session doing nothing but optimize the PTX kernel itself: 2D register
-      blocking, vectorized shared-memory reads, larger tiles — 12.9% of
+      blocking, vectorized shared-memory reads, larger tiles: 12.9% of
       cuBLAS to 53.0% at the kernel level, then a benchmarking-methodology
       fix (below) revealed the true number was higher still, 84.3%.</p>
 
@@ -252,7 +252,7 @@
         <tr><td>5 · GPU runtime</td><td>Driver API execution, module cache, buffer liveness</td><td><span class="pill done">done</span></td></tr>
         <tr><td>6 · Autodiff</td><td>reverse-mode, gradient-checked against finite differences</td><td><span class="pill done">done</span></td></tr>
         <tr><td>7 · Advanced optimizations</td><td>broadcast bias-add, device buffer liveness, kernel autoresearch</td><td><span class="pill done">done</span></td></tr>
-        <tr><td>8 · Multi-GPU</td><td>ring all-reduce / tensor &amp; pipeline parallelism</td><td><span class="pill doc">design doc only — see Limitations</span></td></tr>
+        <tr><td>8 · Multi-GPU</td><td>ring all-reduce / tensor &amp; pipeline parallelism</td><td><span class="pill doc">design doc only, see Limitations</span></td></tr>
       </tbody>
     </table>
     </div>
@@ -271,7 +271,7 @@
     <div class="panel">
       <h3>The two bugs a DAG-shaped test found that a chain-shaped one couldn't</h3>
       <p>Every test that existed before this session built <em>chain</em>-shaped
-        graphs — <code class="mono">matmul → add → relu → matmul → …</code>.
+        graphs: <code class="mono">matmul → add → relu → matmul → …</code>.
         Writing a genuinely diamond-shaped test (a shared leaf feeding two
         independent fused branches a third node then combines) surfaced two
         real, previously-shipped bugs in the same afternoon:</p>
@@ -280,11 +280,11 @@
           It rewrote a fused node's <code class="mono">inputs[]</code> when one of
           its epilogue operands was itself later folded into something else, but
           not the redundant <code class="mono">epilogue[].operand</code> copy of
-          the same pointer — which then dereferenced freed memory the next time
+          the same pointer, which then dereferenced freed memory the next time
           the node executed. Segfaulted reliably on the repro.</li>
         <li><b>An invalid execution order in <code class="mono">gpu_execute</code>.</b>
           It derived its schedule by reversing a preorder traversal, which is
-          only a valid topological order for a tree or chain — for a real DAG,
+          only a valid topological order for a tree or chain; for a real DAG,
           a shared node can be scheduled after a consumer that needed it
           already uploaded. Replaced with a proper postorder traversal
           (<code class="mono">graph_topo_order</code>), shared with the
@@ -292,7 +292,7 @@
       </ul>
       <p>Two more were found earlier the same session: a memory leak in
         multi-level constant folding (an intermediate const node superseded by
-        a later fold was never freed — confirmed with an allocation trace, not
+        a later fold was never freed: confirmed with an allocation trace, not
         just inspection), and unvalidated batch dimensions in matmul that
         could silently read past a smaller operand instead of erroring. All
         four now have permanent regression tests.</p>
@@ -306,16 +306,16 @@
       5–12 independent, process-isolated measurements per point (methodology
       and why that took two attempts to get right is its own story, right
       below the charts). The kernel itself improved 4.1× this session (2D
-      register blocking, vectorized shared-memory reads, larger tiles —
+      register blocking, vectorized shared-memory reads, larger tiles:
       <a href="research/gemm-optimization.md">full writeup</a>); fixing how
       it was <em>measured</em> moved the reported number by almost as much
       again, which is the more important lesson here.</p>
 
     <div class="panel">
-      <h3>Two benchmarking bugs, not one — the second one moved the headline number more</h3>
+      <h3>Two benchmarking bugs, not one: the second one moved the headline number more</h3>
       <p>The first published version of this report measured MiniXLA's GPU
         time via <code class="mono">gpu_execute</code>, which re-uploads its
-        inputs on every call — fair for measuring a full multi-kernel graph
+        inputs on every call: fair for measuring a full multi-kernel graph
         end to end, wrong for comparing raw kernel throughput against
         <code class="mono">cublasSgemm</code> timed around the call alone
         with operands already resident. Fixed with a dedicated kernel-only
@@ -324,7 +324,7 @@
       <p>That fix alone didn't explain everything. Re-running the full sweep
         afterward reproducibly showed <em>both</em> cuBLAS and MiniXLA
         reading roughly 7× slower at exactly one size (512×512) than an
-        isolated single-call measurement of the identical code — with GPU
+        isolated single-call measurement of the identical code, with GPU
         temperature ruling out thermal throttling and a 5×–15× larger warmup
         count not fixing it either. What did: running each
         <code class="mono">(system, size)</code> pair in its own fresh
@@ -333,17 +333,17 @@
         (allocator state or cuBLAS's internal heuristics reacting to
         something about sharing a context, not identified further), and it
         was inflating the <em>gap</em> between the two systems, not shrinking
-        it — the honest comparison this fix produced is more favorable to
+        it: the honest comparison this fix produced is more favorable to
         MiniXLA than the flawed one, not less, which is exactly why it
         needed fixing rather than leaving alone.</p>
     </div>
 
     <div class="chart-card panel">
-      <h3>MiniXLA GPU vs. CPU — the case for a compiler at all</h3>
+      <h3>MiniXLA GPU vs. CPU: the case for a compiler at all</h3>
       <p class="note">Same operation (raw matmul), same machine. The
         optimized kernel widens this gap dramatically over the version in
         the first published report: 13× at 128×128 up to 557× at
-        1024×1024 (2048 CPU is untimed — the naive O(n³) loop would take
+        1024×1024 (2048 CPU is untimed; the naive O(n³) loop would take
         tens of minutes for a number nobody needs).</p>
       <div class="chart-scroll">
         <svg class="chart" id="chart-cpu-gpu" viewBox="0 0 720 340" role="img" aria-label="MiniXLA CPU vs GPU matmul time by size, log scale"></svg>
@@ -355,7 +355,7 @@
       <h3>Raw matmul: MiniXLA vs. cuBLAS vs. PyTorch eager</h3>
       <p class="note">GFLOPS achieved (higher is better), log scale. MiniXLA
         closes from roughly 5–7× behind cuBLAS at small sizes to within 1.2×
-        at 2048×2048 — the opposite shape from what you'd expect if the
+        at 2048×2048: the opposite shape from what you'd expect if the
         remaining gap were purely "no tensor cores": that fixed hardware-path
         gap should be roughly constant across sizes, so the fact it
         <em>narrows</em> says MiniXLA's kernel is specifically weak at small
@@ -370,8 +370,8 @@
     <div class="table-scroll panel">
       <h3>Same data, as % of cuBLAS</h3>
       <p class="note" style="margin-top:0">cuBLAS on Ampere+ opportunistically
-        uses TF32 tensor cores for FP32 GEMM by default — a different
-        hardware path, not just a better-tuned kernel — so 100% here was
+        uses TF32 tensor cores for FP32 GEMM by default (a different
+        hardware path, not just a better-tuned kernel), so 100% here was
         never really the target; closing the CUDA-core-only gap (siboehm's
         reproduced ceiling: 93.7% of cuBLAS with no tensor cores at all) is.
         MiniXLA measured against MiniXLA's own kernel, isolating just the
@@ -391,12 +391,12 @@
     <div class="chart-card panel">
       <h3>Does fusion actually help? A cleaner test than "vs. PyTorch"</h3>
       <p class="note">Comparing MiniXLA's fused kernel against PyTorch's
-        unfused 3-kernel sequence conflates two different questions — does
+        unfused 3-kernel sequence conflates two different questions: does
         fusion help, and is MiniXLA's raw kernel as efficient as cuBLAS's.
         Isolating the first: same kernel infrastructure, matmul-only vs.
         matmul+bias+relu fused into the same launch. The epilogue's marginal
         cost is small and roughly flat now (0–15% depending on size, mostly
-        under 4%) — the vectorized-load work this session also made the
+        under 4%): the vectorized-load work this session also made the
         epilogue itself cheaper to bolt on, not just the matmul faster.</p>
       <div class="chart-scroll">
         <svg class="chart" id="chart-fusion" viewBox="0 0 720 300" role="img" aria-label="Fusion epilogue overhead: matmul-only vs fused, by size"></svg>
@@ -404,9 +404,9 @@
       <div class="legend" id="legend-fusion"></div>
       <p class="note" style="margin-top:1rem"><b style="color:var(--ink)">The updated picture vs. PyTorch's unfused eager sequence:</b>
         MiniXLA's fused kernel is now <em>faster</em> than PyTorch's unfused
-        3-kernel sequence at 128×128 (1.13×) — small enough that per-launch
-        overhead dominates and fusion's launch-count reduction wins outright
-        — then behind at every larger size measured (1.12×–1.72×, worst at
+        3-kernel sequence at 128×128 (1.13×), small enough that per-launch
+        overhead dominates and fusion's launch-count reduction wins outright,
+        then behind at every larger size measured (1.12×–1.72×, worst at
         512×512), converging back toward parity by 2048×2048. Fusion is a
         real, working lever; it's not yet enough on its own to beat a
         cuBLAS/cuDNN-backed unfused sequence once problems are big enough
@@ -419,10 +419,10 @@
     <h2>How these numbers were produced</h2>
     <div class="panel">
       <ul class="tight">
-        <li><b>Process isolation, not one shared process.</b> Every (system, size) pair — cuBLAS at 512, MiniXLA GPU at 1024, and so on — now runs via <code class="mono">bench --pair &lt;kind&gt; &lt;size&gt;</code>, a fresh process with its own CUDA context, launched and torn down before the next pair starts. Sharing one context between cuBLAS and MiniXLA calls turned out to produce a reproducible cross-system slowdown (see the panel above) — isolation is the fix, and it's now the only mode these numbers are drawn from. The full-sweep single-process mode still exists for quick local iteration but its output is not what's reported here.</li>
-        <li><b>Timing.</b> GPU: CUDA events bracketing the kernel launch only, after uploading inputs once — <code class="mono">gpu_time_kernel_ms</code> excludes host-side allocation and transfer, deliberately, so it's comparable to how cuBLAS is timed. CPU: batched wall-clock (<code class="mono">clock()</code>) — this platform's clock has ~15ms resolution, so small matmuls are timed in batches of up to 100 and divided, not timed individually.</li>
-        <li><b>Aggregation: median, not min, of 5–12 isolated-process samples.</b> A fresh process needs its own cold-start clock ramp-up (150 warmup launches, tuned by watching <code class="mono">nvidia-smi</code>'s clock reading climb from an idle ~210MHz to boost ~1890MHz — not simply a function of warmup count, but of the process running long enough to reach steady state), and even after warmup, run-to-run variance across fresh processes is real (cuBLAS at 2048×2048 ranged 2.08–2.76ms across 12 samples). Reporting the median of several isolated runs, rather than the minimum of one run's internal repeats, is a deliberate choice to avoid quietly cherry-picking a lucky sample.</li>
-        <li><b>torch.compile was not available</b> on this Windows machine — it requires Triton, which has no working Windows install here (verified: <code class="mono">TritonMissing</code> at compile time). PyTorch numbers are eager mode, which is what a real user gets on this platform without extra tooling.</li>
+        <li><b>Process isolation, not one shared process.</b> Every (system, size) pair (cuBLAS at 512, MiniXLA GPU at 1024, and so on) now runs via <code class="mono">bench --pair &lt;kind&gt; &lt;size&gt;</code>, a fresh process with its own CUDA context, launched and torn down before the next pair starts. Sharing one context between cuBLAS and MiniXLA calls turned out to produce a reproducible cross-system slowdown (see the panel above); isolation is the fix, and it's now the only mode these numbers are drawn from. The full-sweep single-process mode still exists for quick local iteration but its output is not what's reported here.</li>
+        <li><b>Timing.</b> GPU: CUDA events bracketing the kernel launch only, after uploading inputs once: <code class="mono">gpu_time_kernel_ms</code> excludes host-side allocation and transfer, deliberately, so it's comparable to how cuBLAS is timed. CPU: batched wall-clock (<code class="mono">clock()</code>); this platform's clock has ~15ms resolution, so small matmuls are timed in batches of up to 100 and divided, not timed individually.</li>
+        <li><b>Aggregation: median, not min, of 5–12 isolated-process samples.</b> A fresh process needs its own cold-start clock ramp-up (150 warmup launches, tuned by watching <code class="mono">nvidia-smi</code>'s clock reading climb from an idle ~210MHz to boost ~1890MHz, not simply a function of warmup count, but of the process running long enough to reach steady state), and even after warmup, run-to-run variance across fresh processes is real (cuBLAS at 2048×2048 ranged 2.08–2.76ms across 12 samples). Reporting the median of several isolated runs, rather than the minimum of one run's internal repeats, is a deliberate choice to avoid quietly cherry-picking a lucky sample.</li>
+        <li><b>torch.compile was not available</b> on this Windows machine: it requires Triton, which has no working Windows install here (verified: <code class="mono">TritonMissing</code> at compile time). PyTorch numbers are eager mode, which is what a real user gets on this platform without extra tooling.</li>
         <li><b>Same random data, same seed scheme</b> across all three systems per size; results are not cherry-picked runs.</li>
       </ul>
       <pre>gcc -O2 -Wall -o tests tests.c graph.c tensor.c optimizer.c ptx.c autodiff.c -lm
@@ -440,10 +440,10 @@ python bench_pytorch.py</pre>
     <div class="callout limits">
       <span class="eyebrow">Scope, not spin</span>
       <ul class="tight">
-        <li><b>The GPU kernel is 2D register-blocked with vectorized shared-memory reads (128×128 block tile, 8×8 per-thread output tile, transposed-A SMEM layout for <code class="mono">ld.shared.v4.f32</code>) — still no tensor cores, no vectorized global loads, no warp tiling, no double buffering.</b> That combination took the kernel from 12.9% to 53.0% of cuBLAS in isolated kernel-only timing (measured at 2048×2048; see <a href="research/gemm-optimization.md">gemm-optimization.md</a> for the full autoresearch log). The remaining gap to cuBLAS's 84.3%-of-cuBLAS end-to-end number is a mix of: cuBLAS opportunistically running FP32 GEMM through TF32 tensor cores on this Ampere+/Ada GPU (a hardware-path difference no amount of CUDA-core tuning alone closes), and CUDA-core-level headroom this session identified but deliberately didn't attempt — global-load vectorization (needs a cooperative-load thread-mapping redesign), warp-level tiling, and <code class="mono">mma.sync</code> tensor-core paths — each scoped out because its failure mode is a plausible-looking wrong answer, not a build error, and this session's correctness-verification budget didn't stretch to cover it. Documented as unattempted, not abandoned.</li>
+        <li><b>The GPU kernel is 2D register-blocked with vectorized shared-memory reads (128×128 block tile, 8×8 per-thread output tile, transposed-A SMEM layout for <code class="mono">ld.shared.v4.f32</code>): still no tensor cores, no vectorized global loads, no warp tiling, no double buffering.</b> That combination took the kernel from 12.9% to 53.0% of cuBLAS in isolated kernel-only timing (measured at 2048×2048; see <a href="research/gemm-optimization.md">gemm-optimization.md</a> for the full autoresearch log). The remaining gap to cuBLAS's 84.3%-of-cuBLAS end-to-end number is a mix of: cuBLAS opportunistically running FP32 GEMM through TF32 tensor cores on this Ampere+/Ada GPU (a hardware-path difference no amount of CUDA-core tuning alone closes), and CUDA-core-level headroom this session identified but deliberately didn't attempt: global-load vectorization (needs a cooperative-load thread-mapping redesign), warp-level tiling, and <code class="mono">mma.sync</code> tensor-core paths, each scoped out because its failure mode is a plausible-looking wrong answer, not a build error, and this session's correctness-verification budget didn't stretch to cover it. Documented as unattempted, not abandoned.</li>
         <li><b>Broadcast bias-add is CPU-only.</b> The PTX emitter and both GPU runtimes assume every fused epilogue operand is full-size; a broadcast (e.g. bias-vector) operand is detected and rejected with a clear error on GPU rather than silently computing a wrong answer, but isn't implemented there yet.</li>
-        <li><b>Multi-GPU is a design doc, not code.</b> This machine has one physical GPU and no NCCL — real tensor/pipeline parallelism can't be built <em>and verified</em> here. Shipping untested distributed-systems code would be exactly the class of bug this session spent most of its time removing from already-shipped code. The architecture (ring all-reduce, Megatron-style column/row-parallel sharding, GPipe-style microbatching) is documented; single-GPU concurrent multi-stream scheduling is identified as the one piece that's honestly buildable here, and is future work.</li>
-        <li><b>No second-order gradients.</b> Autodiff computes gradient tensors directly rather than building a differentiable backward graph — sufficient for training, not for meta-learning.</li>
+        <li><b>Multi-GPU is a design doc, not code.</b> This machine has one physical GPU and no NCCL: real tensor/pipeline parallelism can't be built <em>and verified</em> here. Shipping untested distributed-systems code would be exactly the class of bug this session spent most of its time removing from already-shipped code. The architecture (ring all-reduce, Megatron-style column/row-parallel sharding, GPipe-style microbatching) is documented; single-GPU concurrent multi-stream scheduling is identified as the one piece that's honestly buildable here, and is future work.</li>
+        <li><b>No second-order gradients.</b> Autodiff computes gradient tensors directly rather than building a differentiable backward graph: sufficient for training, not for meta-learning.</li>
       </ul>
     </div>
   </section>

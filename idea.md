@@ -45,7 +45,7 @@ Execution Results
 
 ## Phases
 
-### Phase 1 — Tensor Library
+### Phase 1: Tensor Library
 
 **Objective:** Create a minimal tensor abstraction and CPU execution backend.
 
@@ -72,7 +72,7 @@ typedef struct {
 
 ---
 
-### Phase 2 — Computational Graph
+### Phase 2: Computational Graph
 
 **Objective:** Represent computations as a directed acyclic graph (DAG).
 
@@ -98,7 +98,7 @@ typedef struct {
 
 ---
 
-### Phase 3 — Graph Optimizer
+### Phase 3: Graph Optimizer
 
 **Objective:** Apply compiler-style optimizations.
 
@@ -107,7 +107,7 @@ typedef struct {
 | Pass | Description | Example |
 |------|-------------|---------|
 | Constant Folding | Evaluate constant sub-expressions at compile time | `2 + 3` → `5` |
-| Dead Node Elimination | Remove nodes whose outputs are never consumed | — |
+| Dead Node Elimination | Remove nodes whose outputs are never consumed | N/A |
 | Operator Fusion | Merge sequential ops into a single kernel | `MatMul → Add → ReLU` → `FusedMatMulAddReLU` |
 | Redundant Op Removal | Eliminate no-op patterns | `Transpose(Transpose(X))` → `X` |
 
@@ -115,7 +115,7 @@ typedef struct {
 
 ---
 
-### Phase 4 — PTX Backend
+### Phase 4: PTX Backend
 
 **Objective:** Generate PTX assembly directly.
 
@@ -133,7 +133,7 @@ st.global.f32  [%rd3], %f3;
 
 ---
 
-### Phase 5 — Runtime System
+### Phase 5: Runtime System
 
 **Objective:** Load and execute generated PTX.
 
@@ -149,15 +149,15 @@ GPU Execution
 ```
 
 **Components:**
-- **Memory Manager** — device allocation, host-device transfers, buffer reuse
-- **Kernel Launcher** — kernel dispatch and configuration
-- **Error Handling** — compilation failures, runtime failures, memory tracking
+- **Memory Manager**: device allocation, host-device transfers, buffer reuse
+- **Kernel Launcher**: kernel dispatch and configuration
+- **Error Handling**: compilation failures, runtime failures, memory tracking
 
 **Deliverables:** PTX loading, execution engine, profiling support.
 
 ---
 
-### Phase 6 — Automatic Differentiation
+### Phase 6: Automatic Differentiation
 
 **Objective:** Implement reverse-mode autodiff.
 
@@ -172,7 +172,7 @@ Forward Pass → Loss → Backward Pass
 
 ---
 
-### Phase 7 — Advanced Optimizations
+### Phase 7: Advanced Optimizations
 
 **Kernel Fusion:**
 ```
@@ -185,7 +185,7 @@ MatMul → Add → ReLU   ──▶   Single Fused Kernel
 
 ---
 
-### Phase 8 — Multi-GPU Research
+### Phase 8: Multi-GPU Research
 
 **Objective:** Explore distributed execution concepts.
 
@@ -254,4 +254,4 @@ MiniXLA/
 
 ## Long-Term Vision
 
-A completed MiniXLA project provides practical, hands-on understanding of the engineering concepts underpinning modern systems including **XLA**, **TensorRT**, **TVM**, **DeepSpeed**, **Megatron-LM**, and custom large-scale AI training stacks — spanning compiler design, GPU architecture, PTX programming, runtime systems, and distributed AI infrastructure.
+A completed MiniXLA project provides practical, hands-on understanding of the engineering concepts underpinning modern systems including **XLA**, **TensorRT**, **TVM**, **DeepSpeed**, **Megatron-LM**, and custom large-scale AI training stacks, spanning compiler design, GPU architecture, PTX programming, runtime systems, and distributed AI infrastructure.

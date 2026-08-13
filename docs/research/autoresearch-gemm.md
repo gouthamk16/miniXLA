@@ -3,9 +3,9 @@
 Adapted from `../../../text_diffusion/program.md` (itself following
 [Karpathy's autoresearch](https://github.com/karpathy/autoresearch)) for
 optimizing a GPU kernel instead of training a model. The mechanism is the
-same — a dedicated branch, one hypothesis per commit, a fixed measurement
+same: a dedicated branch, one hypothesis per commit, a fixed measurement
 protocol, a TSV log, keep-if-better/revert-if-not, loop without stopping to
-ask — with one addition the training-loop version doesn't need: **a
+ask, with one addition the training-loop version doesn't need: **a
 correctness gate before a change is even eligible to be judged on speed.**
 A fast GEMM kernel that computes the wrong answer is worse than no change at
 all, and unlike a val-loss regression, a wrong kernel can look completely
@@ -29,7 +29,7 @@ nvcc -o gpu_test gpu_test.c graph.c tensor.c optimizer.c ptx.c runtime.c gpu_exe
 ```
 
 `gpu_test` compares every GPU result against the CPU reference (`execute()`)
-to `1e-4`–`1e-2` depending on size — that comparison is the ground truth, the
+to `1e-4`–`1e-2` depending on size: that comparison is the ground truth, the
 same role `evaluate_bpb` plays in the training-loop version. If either
 suite fails or a result silently drifts outside tolerance, the change is a
 `crash` regardless of how fast it benchmarked, full stop.
@@ -39,14 +39,14 @@ suite fails or a result silently drifts outside tolerance, the change is a
 One fixed reference size for fast iteration: **2048×2048×2048**, the size
 where cuBLAS is closest to its own peak and the CUDA-core gap is cleanest to
 see. `min` of 10 timed launches after 5 warmup launches (lighter than the
-published report's 20-after-10 — this runs many times per session, the
+published report's 20-after-10; this runs many times per session, the
 report's own numbers get a full re-measurement at the end, not every
 intermediate step). Report GFLOPS and % of cuBLAS at that size (cuBLAS's own
-number doesn't change between experiments — measure it once, reuse it).
+number doesn't change between experiments: measure it once, reuse it).
 
 ## Logging results
 
-`docs/research/results.tsv` (tab-separated; not committed — same as the
+`docs/research/results.tsv` (tab-separated; not committed, same as the
 training-loop version, it's a local log, not source). Columns:
 
 ```
@@ -79,5 +79,5 @@ When every item in the priority list is exhausted: re-read
 warptiling, tensor cores) rather than stopping. Merge to `main` and update
 the published benchmark report once the loop has produced a meaningfully
 better number and there's nothing left in the plan worth the remaining risk
-(tensor cores especially — see that section's risk note before attempting
+(tensor cores especially, see that section's risk note before attempting
 it under time pressure).

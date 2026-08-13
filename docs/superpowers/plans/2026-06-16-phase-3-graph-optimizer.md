@@ -1,8 +1,8 @@
-# Phase 3 — Graph Optimizer Implementation Plan
+# Phase 3: Graph Optimizer Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a compiler-style optimizer that rewrites the Node DAG in place — redundant-op removal, constant folding, operator fusion, dead-node elimination — driven by a pass manager that runs to a fixpoint.
+**Goal:** Add a compiler-style optimizer that rewrites the Node DAG in place (redundant-op removal, constant folding, operator fusion, dead-node elimination), driven by a pass manager that runs to a fixpoint.
 
 **Architecture:** Passes mutate the existing graph in place and return "did I change anything?" so a manager loops them to a fixpoint, then frees orphaned nodes. Fusion collapses a single-use `matmul` + element-wise chain into one `OP_FUSED` node whose executor runs the whole region in one loop per output cell, allocating no intermediates. Optimizer logic lives in its own translation unit; graph-structure additions live in `graph.c`/`graph.h`.
 
@@ -12,11 +12,11 @@
 
 ## File structure
 
-- `tensor.c` / `tensor.h` — unchanged (kernels).
-- `graph.h` / `graph.c` — graph construction + execution. Gains `is_const`, `uses`, `OP_FUSED`, `EpStep`, `const_node`, `fused_node`, public `eval_op`, public `graph_collect`. `main()` moves out.
-- `main.c` — the demo `main()` extracted from `graph.c` (keeps the library linkable against a test harness).
-- `optimizer.h` / `optimizer.c` — the four passes, the helpers (`replace`, `count_uses`, `sole_consumer`), and `optimize`.
-- `tests.c` — `assert`-based test harness with its own `main()`.
+- `tensor.c` / `tensor.h`: unchanged (kernels).
+- `graph.h` / `graph.c`: graph construction + execution. Gains `is_const`, `uses`, `OP_FUSED`, `EpStep`, `const_node`, `fused_node`, public `eval_op`, public `graph_collect`. `main()` moves out.
+- `main.c`: the demo `main()` extracted from `graph.c` (keeps the library linkable against a test harness).
+- `optimizer.h` / `optimizer.c`: the four passes, the helpers (`replace`, `count_uses`, `sole_consumer`), and `optimize`.
+- `tests.c`: `assert`-based test harness with its own `main()`.
 
 Build commands used throughout:
 - Demo: `gcc -O2 -Wall -o demo main.c graph.c tensor.c optimizer.c -lm`
@@ -30,7 +30,7 @@ Build commands used throughout:
 
 **Files:**
 - Create: `main.c`
-- Modify: `graph.c` (remove `main()` and `#include <stdio.h>` only if now unused — keep it; `fprintf` still used)
+- Modify: `graph.c` (remove `main()` and `#include <stdio.h>` only if now unused; keep it; `fprintf` still used)
 
 - [ ] **Step 1: Create `main.c` with the existing demo**
 
@@ -204,7 +204,7 @@ int main(void) {
 - [ ] **Step 2: Run it to confirm it fails to compile**
 
 Run: `gcc -O2 -Wall -o tests tests.c graph.c tensor.c -lm`
-Expected: FAIL — `const_node` and `eval_op` undeclared.
+Expected: FAIL (`const_node` and `eval_op` undeclared).
 
 - [ ] **Step 3: Extend the `Node` struct and declarations in `graph.h`**
 
@@ -313,7 +313,7 @@ Replace the `switch` inside `execute` with a single call:
     Tensor* out = eval_op(node, in);
     free(in);
 ```
-(`#include <string.h>` is needed in `graph.c` for `memcpy` — add it if not present.)
+(`#include <string.h>` is needed in `graph.c` for `memcpy`; add it if not present.)
 
 - [ ] **Step 5: Build and run the test**
 
@@ -364,7 +364,7 @@ static void test_fused_exec(void) {
 - [ ] **Step 2: Run to confirm failure**
 
 Run: `gcc -O2 -Wall -o tests tests.c graph.c tensor.c -lm`
-Expected: FAIL — `fused_node` undeclared (declared in Task 3's header but not yet defined).
+Expected: FAIL (`fused_node` undeclared; declared in Task 3's header but not yet defined).
 
 - [ ] **Step 3: Implement `fused_node` in `graph.c`**
 
@@ -452,7 +452,7 @@ Call `test_redundant_removal();` from `main`.
 - [ ] **Step 2: Run to confirm failure**
 
 Run: `gcc -O2 -Wall -o tests tests.c graph.c tensor.c -lm`
-Expected: FAIL — `optimizer.h` not found / `optimize` undeclared.
+Expected: FAIL (`optimizer.h` not found / `optimize` undeclared).
 
 - [ ] **Step 3: Create `optimizer.h`**
 
@@ -563,7 +563,7 @@ Call `test_constant_folding();` from `main`.
 - [ ] **Step 2: Run to confirm failure**
 
 Run: `gcc -O2 -Wall -o tests tests.c graph.c tensor.c optimizer.c -lm && ./tests`
-Expected: FAIL — `root->op` is `OP_MATMUL`, assertion fails (folding not implemented yet).
+Expected: FAIL (`root->op` is `OP_MATMUL`, assertion fails; folding not implemented yet).
 
 - [ ] **Step 3: Add the constant-folding pass to `optimizer.c`**
 
@@ -667,7 +667,7 @@ Call `test_fusion();` from `main`.
 - [ ] **Step 2: Run to confirm failure**
 
 Run: `gcc -O2 -Wall -o tests tests.c graph.c tensor.c optimizer.c -lm && ./tests`
-Expected: FAIL — `root->op` is `OP_RELU`, not `OP_FUSED`.
+Expected: FAIL (`root->op` is `OP_RELU`, not `OP_FUSED`).
 
 - [ ] **Step 3: Add use-counting, sole-consumer lookup, and the fusion pass to `optimizer.c`**
 
@@ -838,7 +838,7 @@ Node* optimize(Node* root) {
 - [ ] **Step 4: Rebuild and rerun under the sanitizer**
 
 Run: `gcc -O1 -g -fsanitize=address -o tests_asan tests.c graph.c tensor.c optimizer.c -lm && ./tests_asan`
-Expected: all tests pass, **no leaks reported**. (Caller still owns the input tensors `a`/`b`/`c`; DCE frees only orphaned nodes, and only their tensors when `owns_output` is set — which for orphaned matmul/add/relu it is not, because their outputs were never executed.)
+Expected: all tests pass, **no leaks reported**. (Caller still owns the input tensors `a`/`b`/`c`; DCE frees only orphaned nodes, and only their tensors when `owns_output` is set, which for orphaned matmul/add/relu it is not, because their outputs were never executed.)
 
 - [ ] **Step 5: Build and run the normal test binary**
 
@@ -906,6 +906,6 @@ git commit -m "demo: run the optimizer end-to-end in main"
 
 ## Self-review notes
 
-- **Spec coverage:** in-place mutation (Task 5–7), `const_node`/`is_const` (Task 3), `OP_FUSED`+`EpStep`+single-loop exec (Task 3–4), `eval_op` refactor (Task 3), `replace` helper (Task 5), redundant-op removal (Task 5), constant folding (Task 6), operator fusion with single-use guard (Task 7), dead-node elimination via `before − live` (Task 8), all three verification cases — fusion correctness, constant folding, transpose-of-transpose — plus a no-leak check (Tasks 5–8). File layout (`optimizer.*` vs `graph.*`) matches the spec.
-- **Deviation from spec:** Task 1 (extract `main` into `main.c`) is an added prerequisite the spec implied — it is required so `tests.c` can own `main()`. The `eval_op` signature was already corrected to non-static in the spec; this plan matches it.
+- **Spec coverage:** in-place mutation (Task 5–7), `const_node`/`is_const` (Task 3), `OP_FUSED`+`EpStep`+single-loop exec (Task 3–4), `eval_op` refactor (Task 3), `replace` helper (Task 5), redundant-op removal (Task 5), constant folding (Task 6), operator fusion with single-use guard (Task 7), dead-node elimination via `before − live` (Task 8), all three verification cases (fusion correctness, constant folding, transpose-of-transpose) plus a no-leak check (Tasks 5–8). File layout (`optimizer.*` vs `graph.*`) matches the spec.
+- **Deviation from spec:** Task 1 (extract `main` into `main.c`) is an added prerequisite the spec implied: it is required so `tests.c` can own `main()`. The `eval_op` signature was already corrected to non-static in the spec; this plan matches it.
 - **Type consistency:** `EpStep { OpType op; Node* operand; }`, `optimize(Node*)`, `eval_op(Node*, Tensor**)`, `graph_collect(Node*, Node***)`, `const_node`/`fused_node` signatures are used identically across all tasks.
