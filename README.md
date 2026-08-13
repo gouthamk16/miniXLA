@@ -1,101 +1,132 @@
 # MiniXLA
 
-A lightweight ML compiler and runtime exploring graph compilation, optimization,
-and PTX code generation on NVIDIA GPUs — a hands-on look at how systems like
-XLA, TensorRT, and TVM turn tensor ops into optimized GPU kernels.
+A small ML compiler in C: you build a tensor DAG, it optimizes the graph,
+emits PTX for fused matmul kernels, and runs them on NVIDIA GPUs through the
+CUDA Driver API.
 
-See `idea.md` for the full phase roadmap and long-term vision, and
-**[the benchmark report](docs/bench_report.html)** for honest, measured
-performance against cuBLAS and PyTorch on real hardware — including where
-MiniXLA is nowhere close (raw kernel throughput) and where the graph
-optimizer earns its keep.
+This is a learning compiler, not a framework. The point is to see the path
+from `matmul → add → relu` to a real kernel, including the bugs that only
+show up on DAGs (shared nodes, fused epilogues) rather than straight chains.
+It is not trying to beat PyTorch or XLA. Measured kernel throughput vs
+cuBLAS is in [the benchmark report](docs/bench_report.html) — including
+where MiniXLA is far behind.
 
-## Status
+The phase roadmap and unfinished ideas live in [`idea.md`](idea.md). This
+README is what actually exists.
 
-| Phase | What | Status |
-|---|---|---|
-| 1 | Tensor library (matmul, add, mul, relu, softmax, transpose) | Done — `tensor.c`/`tensor.h` |
-| 2 | Computational graph (DAG construction, execution) | Done — `graph.c`/`graph.h` |
-| 3 | Graph optimizer (constant folding, dead-node elimination, redundant-op removal, operator fusion) | Done — `optimizer.c`/`optimizer.h` |
-| 4 | PTX backend (tiled shared-memory matmul + fused epilogue codegen) | Done — `ptx.c`/`ptx.h` |
-| 5 | GPU runtime (CUDA Driver API execution, multi-kernel graphs, module caching, tile-size autotuning, last-use buffer freeing) | Done — `runtime.c`/`runtime.h`, `gpu_exec.c`/`gpu_exec.h` |
-| 6 | Autodiff (reverse-mode, gradient-checked) | Done — `autodiff.c`/`autodiff.h` |
-| 7 | Advanced optimizations (broadcast bias-add, GPU buffer liveness) | Done |
-| 8 | Multi-GPU (tensor/pipeline parallelism, collectives) | **Design doc only** — see below |
+## Pipeline
 
-Design docs for every phase live in `docs/superpowers/specs/`.
+```
+g_matmul / g_add / g_relu / …
+        │
+        ▼
+   computational DAG
+        │
+        ▼
+     optimize()          constant fold, drop redundant transposes,
+        │                fuse matmul + elementwise into OP_FUSED
+        ▼
+     emit_ptx()          tiled shared-memory GEMM + fused epilogue
+        │
+        ▼
+   gpu_execute()         CUDA Driver API, module cache, last-use free
+```
 
-Every phase above is verified end-to-end against real hardware, not just
-compiled: 18 CPU tests (`gcc`, includes a `ptxas`-validated codegen check and
-finite-difference gradient checks for autodiff) and 8 GPU tests (`nvcc`,
-actually execute generated PTX on a CUDA device and compare against the CPU
-reference to `1e-4`–`1e-2`, looser at larger sizes where fp32 accumulation
-order legitimately diverges). Two of those GPU-path tests exist specifically
-because they're DAG-shaped (a shared node feeding two independent branches) —
-that shape caught two real bugs in already-shipped code that every earlier,
-chain-shaped test had missed. See the benchmark report's Correctness section
-for the full story.
+CPU `execute()` runs the same optimized graph. GPU results are checked
+against that reference.
 
-Phase 8 is a design doc, not code: this machine has one physical GPU and no
-NCCL, so real multi-device execution can't be built *and verified* here.
-Shipping that untested would be exactly the class of bug the rest of this
-project spent its time removing from already-shipped code instead.
+## Example
+
+```c
+Tensor* a = create_tensor((float[]){1, 2, 3, 4, 5, 6}, (int[]){2, 3}, 2);
+Tensor* b = create_tensor((float[]){1, 2, 3, 4, 5, 6}, (int[]){3, 2}, 2);
+Tensor* c = create_tensor((float[]){-100, 0, 0, -100}, (int[]){2, 2}, 2);
+
+Node* root = g_relu(g_add(g_matmul(input_node(a), input_node(b)), input_node(c)));
+root = optimize(root);              // OP_FUSED: matmul + add + relu
+
+print_tensor(execute(root));        // CPU
+// or: gpu_execute(root, gpu_ctx_create());
+```
+
+`main.c` is this program. Expected output: `[[0, 28], [49, 0]]`.
+
+## What works
+
+| Layer | Ops / behavior |
+|---|---|
+| Tensors | `matmul`, `add` (including trailing-suffix bias broadcast), `mul`, `relu`, `softmax`, `transpose`, `permute`. CPU matmul is batched. |
+| Graph | `g_*` constructors, `input_node` / `const_node`, `execute`, `graph_collect` (reachability), `graph_topo_order` (dependency order). |
+| Optimizer | Constant folding, redundant-op removal (`transpose(transpose(x))`), operator fusion into `OP_FUSED` with an epilogue. Runs to a fixpoint; orphans are freed after every pass. |
+| PTX | 2-D register-blocked GEMM (`BM×BN` tile, `TM×TN` per thread) plus fused add/mul/relu epilogue. Arbitrary M/N/K via predicated boundary loads. |
+| GPU runtime | Full-DAG execution of fused kernels, intermediates stay on device, last-use buffer free, PTX module cache. |
+| Autodiff | Reverse-mode `backward()` on the **unoptimized** graph. Gradients are tensors, not a second graph. Finite-difference checked. |
+
+Constraints that have bitten real code (and have tests):
+
+- GPU kernels are 2-D. There is no batch dimension in PTX.
+- GPU `OP_ADD` epilogue operands must be full `M×N`. Broadcast bias-add is CPU-only; the GPU path refuses it rather than compute the wrong thing.
+- `backward()` must run **before** `optimize()`. Fused nodes have no VJP.
+- `graph_topo_order` is not “reverse of `graph_collect`”. Reversing preorder is only valid for a tree; a shared node feeding two branches is a different order. Both GPU scheduling and autodiff need the real topo order.
 
 ## Build
 
-Requires `gcc` for the CPU-only pieces, and `nvcc` + a CUDA-capable GPU for
-anything touching the GPU runtime (`nvcc` finds MSVC as its host compiler on
-Windows and compiles this project's C99 directly — no separate C++ shim
-needed). The benchmark harness additionally needs cuBLAS (ships with the CUDA
-toolkit) and, for the PyTorch comparison points, a Python environment with
-`torch` installed.
+`gcc` for anything that never touches CUDA. `nvcc` + a CUDA GPU for the
+runtime (`nvcc` uses MSVC as the host compiler on Windows and compiles this
+C99 as-is). Benchmarks also want cuBLAS (CUDA toolkit) and, for the PyTorch
+points, a Python env with `torch`.
 
 ```sh
-# Demo: builds the graph, optimizes it, runs it on CPU.
+# CPU demo
 gcc -O2 -Wall -o demo main.c graph.c tensor.c optimizer.c -lm
 ./demo
 
-# CPU test suite (graph, optimizer, autodiff, and PTX codegen validation via ptxas).
+# CPU tests: graph, optimizer, autodiff, ptxas-validated codegen
 gcc -O2 -Wall -o tests tests.c graph.c tensor.c optimizer.c ptx.c autodiff.c -lm
 ./tests
 
-# GPU end-to-end tests: assembles and runs generated PTX on the GPU, checks
-# it against the CPU reference. Requires nvcc and a CUDA device.
+# GPU tests: assemble PTX, run it, compare to CPU (1e-4 … 1e-2)
 nvcc -o gpu_test gpu_test.c graph.c tensor.c optimizer.c ptx.c runtime.c gpu_exec.c -lcuda
 ./gpu_test
 
-# Benchmarks: MiniXLA (GPU + CPU) vs cuBLAS, and separately vs PyTorch.
+# Benchmarks vs cuBLAS, then vs PyTorch
 nvcc -O2 -o bench bench.c graph.c tensor.c optimizer.c ptx.c gpu_exec.c -lcuda -lcublas
 ./bench
 python bench_pytorch.py
 ```
 
+18 CPU tests, 7 GPU tests (including a diamond DAG that caught two shipped
+bugs chain-shaped tests missed). Both suites should pass before a change to
+`graph.c`, `optimizer.c`, `tensor.c`, `ptx.c`, `runtime.c`, or `gpu_exec.c`
+is done — the two backends execute the same optimized graphs.
+
 ## Layout
 
-- `tensor.c` / `tensor.h` — CPU tensor ops (matmul, add, mul, relu, softmax,
-  transpose, permute). `tensor_add` supports the standard bias-broadcast
-  case (a trailing-suffix shape, e.g. `[N]` against `[M,N]`).
-- `graph.c` / `graph.h` — the computational graph: node construction,
-  execution, `graph_topo_order` (the traversal both the optimizer and
-  autodiff build on), and the `OP_FUSED` executor for optimizer-fused
-  regions.
-- `optimizer.c` / `optimizer.h` — the four optimization passes and the
-  fixpoint pass manager.
-- `autodiff.c` / `autodiff.h` — reverse-mode autodiff over an already-
-  executed graph (eager gradient tensors, not a second differentiable
-  graph — see the Phase 6 design doc for why).
-- `ptx.c` / `ptx.h` — PTX emitter for fused matmul+epilogue regions (tiled
-  shared-memory matmul, arbitrary M/N/K via predicated boundary loads).
-- `runtime.c` / `runtime.h` — minimal CUDA Driver API runner for a single
-  fused kernel.
-- `gpu_exec.c` / `gpu_exec.h` — full-graph GPU execution: runs a chain of
-  `OP_FUSED` kernels keeping intermediates on-device (freeing each one right
-  after its last consumer runs), caches compiled modules, and autotunes tile
-  size per epilogue shape.
-- `main.c` — the CPU demo.
-- `tests.c` — CPU-only test suite (`gcc`).
-- `gpu_test.c` — GPU end-to-end test suite (`nvcc`, needs a device).
-- `bench.c` / `bench_pytorch.py` — the benchmark harness behind
-  `docs/bench_report.html`.
-- `docs/superpowers/` — design docs for every phase.
-- `docs/bench_report.html` — the published benchmark report.
+| File | Role |
+|---|---|
+| `tensor.c` / `tensor.h` | CPU tensor ops and memory |
+| `graph.c` / `graph.h` | DAG, execution, fused-node CPU executor |
+| `optimizer.c` / `optimizer.h` | Passes + fixpoint manager |
+| `ptx.c` / `ptx.h` | PTX emitter |
+| `runtime.c` / `runtime.h` | Single fused kernel via CUDA Driver API |
+| `gpu_exec.c` / `gpu_exec.h` | Full-graph GPU execution |
+| `autodiff.c` / `autodiff.h` | Reverse-mode gradients |
+| `main.c` | CPU demo |
+| `tests.c` | CPU suite |
+| `gpu_test.c` | GPU suite |
+| `bench.c` / `bench_pytorch.py` | Numbers behind the report |
+
+## Docs
+
+- [`docs/bench_report.html`](docs/bench_report.html) — measured vs cuBLAS and PyTorch
+- [`docs/superpowers/specs/`](docs/superpowers/specs/) — design notes per phase
+- [`docs/research/gemm-optimization.md`](docs/research/gemm-optimization.md) — kernel worklog (register blocking → vectorized loads → autotune → tensor cores)
+- [`idea.md`](idea.md) — original roadmap. Phase 8 (multi-GPU) is a design doc only: this machine has one GPU and no NCCL.
+
+## Status
+
+Phases 1–7 are implemented and hardware-checked. The remaining work is
+kernel performance, not missing compiler stages. The current emitter is a
+CUDA-core GEMM with 2-D register blocking; cuBLAS on Ampere+ typically uses
+TF32 tensor cores, so a large fraction of that gap is a different hardware
+path, not just a worse tile size.

@@ -13,29 +13,21 @@ GpuCtx* gpu_ctx_create(void);
 void    gpu_ctx_destroy(GpuCtx* ctx);
 
 // Execute the full optimized DAG on GPU. Uploads OP_INPUT tensors, runs each
-// OP_FUSED kernel (using the tuned tile size if gpu_autotune was called),
-// keeps intermediates on device, downloads the root result.
+// OP_FUSED kernel, keeps intermediates on device, downloads the root result.
 // Requires every non-leaf node in the graph to be OP_FUSED.
 // Returns a fresh host Tensor (caller frees). Returns NULL on any failure.
 Tensor* gpu_execute(Node* root, GpuCtx* ctx);
 
-// Benchmark tile sizes {8, 16, 32} for the given OP_FUSED node using CUDA
-// events (5 warmup + 5 timed runs each). Stores the optimal tile in ctx and
-// returns it. Subsequent gpu_execute calls use that tile for matching nodes.
-// Requires root->inputs[0]->output and root->inputs[1]->output to be set.
-int gpu_autotune(Node* root, GpuCtx* ctx);
-
 // Kernel-only timing for a single OP_FUSED node: uploads inputs once, then
 // times `warmup` throwaway launches followed by `reps` timed launches
-// (returns the min, same convention as gpu_autotune's own internal timing).
-// Deliberately excludes host<->device transfer and allocation overhead --
-// gpu_execute times a full DAG's worth of that too, which is the right
-// thing to measure for end-to-end multi-kernel execution but the wrong
-// thing to measure when comparing this kernel's own throughput against a
-// library call benchmarked the same way (e.g. cublasSgemm timed around the
-// call alone, operands already resident on device). Requires
-// root->inputs[0]->output and root->inputs[1]->output to be set. Returns
-// -1.0 on failure.
+// (returns the min). Deliberately excludes host<->device transfer and
+// allocation overhead -- gpu_execute times a full DAG's worth of that too,
+// which is the right thing to measure for end-to-end multi-kernel execution
+// but the wrong thing to measure when comparing this kernel's own
+// throughput against a library call benchmarked the same way (e.g.
+// cublasSgemm timed around the call alone, operands already resident on
+// device). Requires root->inputs[0]->output and root->inputs[1]->output to
+// be set. Returns -1.0 on failure.
 double gpu_time_kernel_ms(Node* root, GpuCtx* ctx, int warmup, int reps);
 
 #endif

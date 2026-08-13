@@ -37,7 +37,6 @@ int main(void) {
     if (!ctx) { fprintf(stderr, "gpu_ctx_create failed\n"); return 1; }
 
     Node* root = fused_node(input_node(ta), input_node(tb), NULL, 0);
-    gpu_autotune(root, ctx);
 
     double ms = gpu_time_kernel_ms(root, ctx, WARMUP, REPS);
     if (ms < 0) { fprintf(stderr, "gpu_time_kernel_ms failed\n"); return 1; }
