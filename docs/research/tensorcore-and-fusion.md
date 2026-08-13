@@ -193,6 +193,67 @@ measures before building it, per this repo's own minimalism rule.
    follow-up regardless, since it's real and independent of whether tensor
    cores land.
 
+## Results: tensor-core stream (autoresearch/tensorcore, full log in results.tsv)
+
+| Experiment | GFLOPS @ 2048^3 | % of cuBLAS | Status |
+|---|---:|---:|---|
+| cuBLAS (this session's fresh measurement) | 7622.9 | 100% | reference |
+| CUDA-core kernel (existing, unchanged) | 6177.4 | 81.1% | reference |
+| 1. TF32 tensor core, naive (1 warp/block, no smem) | 2934.7 | 38.5% | kept |
+| 2. + shared-memory blocking (8 warps/block, 32x32x8 tile) | 3914.8 | 51.4% | kept |
+| K-tile 8->32 (4x mma per smem reload) | 2572.7 | 33.8% | discarded (slower, 3 isolated repeats) |
+| Block tile 32x32->64x64 (32 warps/block) | -- | -- | discarded (correctness bug, not a perf regression) |
+
+Correctness held at every step (boundary-ragged shapes, ADD+RELU epilogue,
+sizes up to 2048x2048x2049) with the sqrt(K)-scaled tolerance derived in
+§1. The fragment-layout risk this doc opened with is fully resolved: not
+one of the four experiments above ever produced a *wrong but plausible*
+number, which was the specific failure mode this whole effort was
+hedged against.
+
+**Performance did not resolve as cleanly.** The tensor-core kernel never
+caught the existing CUDA-core kernel, let alone cuBLAS, at the reference
+size. Two follow-up experiments aimed at closing that gap failed for two
+different reasons, both instructive:
+
+- Deepening the K-tile (amortizing the load/barrier pair over more mma
+  calls, the exact lever that helped the CUDA-core kernel go from BK=8 to
+  its current shape) made this kernel *slower*, consistently, across three
+  isolated-process repeats — not noise. The likely cause is register
+  pressure/occupancy from unrolling 4x more loads+converts+mma per k-tile,
+  but this wasn't root-caused with a profiler (Nsight Compute wasn't run
+  this session); it's reported as an observation, not a diagnosed
+  mechanism.
+- Doubling the block tile to 64x64 (32 warps/block, the natural next step
+  toward matching the CUDA-core kernel's own 128x128 block) hit a real
+  bug, not a perf ceiling: the cooperative-load loop assumed
+  `TC_BM*TC_BK >= TC_NTHREADS` (true at 32x32, where they're exactly
+  equal) so every thread loads at least one element; at 64x64 the block
+  covers 1024 threads but the A/B tiles only have 512 elements each,
+  making the iteration count `A_ELEMS/TC_NTHREADS` truncate to 0 via
+  integer division and leaving shared memory uninitialized. Fixable (loop
+  needs to become a predicated `tid < A_ELEMS` guard rather than an
+  iteration count for tile shapes where threads outnumber elements) but a
+  real code change, not a one-line tune — deferred rather than rushed
+  given the exact risk this whole stream has been careful about.
+
+The honest conclusion: **this session's tensor-core kernel is correct but
+not fast enough to beat cuBLAS, PyTorch, or even this repo's own
+CUDA-core kernel at raw GEMM.** 51.4% of cuBLAS on a first-afternoon
+tensor-core kernel against a target that's itself running near-peak
+tensor cores is a real result, not a failure, but it doesn't move the
+"beat PyTorch" needle on this axis. That's consistent with this doc's own
+opening argument in §3: raw GEMM GFLOPS was always the hardest place to
+win. See the fused-latency and memory results below for where the honest
+opportunity actually was.
+
+Merged to `main` locally (correctness-verified, additive, doesn't touch
+`emit_ptx_blocked` or any existing caller) despite not beating the
+CUDA-core kernel on speed, on the same basis the CPU reference path is
+kept: it's a real, tested, independently useful artifact (the first
+tensor-core code in this repo, with a verified fragment layout future
+sessions can build on) even though it isn't today's fastest path.
+
 ## Sources
 
 - [PTX ISA 9.3, §9.7.15.5.7 "Matrix Fragments for mma.m16n8k8"](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-1688) (fetched and read directly, not summarized — the primary source for the fragment layout used in this session's kernel)
