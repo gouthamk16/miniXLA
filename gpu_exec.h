@@ -25,4 +25,17 @@ Tensor* gpu_execute(Node* root, GpuCtx* ctx);
 // Requires root->inputs[0]->output and root->inputs[1]->output to be set.
 int gpu_autotune(Node* root, GpuCtx* ctx);
 
+// Kernel-only timing for a single OP_FUSED node: uploads inputs once, then
+// times `warmup` throwaway launches followed by `reps` timed launches
+// (returns the min, same convention as gpu_autotune's own internal timing).
+// Deliberately excludes host<->device transfer and allocation overhead --
+// gpu_execute times a full DAG's worth of that too, which is the right
+// thing to measure for end-to-end multi-kernel execution but the wrong
+// thing to measure when comparing this kernel's own throughput against a
+// library call benchmarked the same way (e.g. cublasSgemm timed around the
+// call alone, operands already resident on device). Requires
+// root->inputs[0]->output and root->inputs[1]->output to be set. Returns
+// -1.0 on failure.
+double gpu_time_kernel_ms(Node* root, GpuCtx* ctx, int warmup, int reps);
+
 #endif

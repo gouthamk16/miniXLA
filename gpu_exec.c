@@ -263,6 +263,94 @@ at_cleanup:
     }
 }
 
+// ---- gpu_time_kernel_ms ----
+
+double gpu_time_kernel_ms(Node* root, GpuCtx* g, int warmup, int reps) {
+    if (root->op != OP_FUSED) return -1.0;
+    if (!root->inputs[0]->output || !root->inputs[1]->output) return -1.0;
+
+    int M, K, N, dummy;
+    node_dims(root->inputs[0], &M, &K);
+    node_dims(root->inputs[1], &dummy, &N);
+
+    int n_add = 0;
+    for (int i = 0; i < root->n_epilogue; i++)
+        if (root->epilogue[i].op == OP_ADD) n_add++;
+
+    Tensor* ta = root->inputs[0]->output;
+    Tensor* tb = root->inputs[1]->output;
+    CUdeviceptr d_a = 0, d_b = 0, d_out = 0;
+    CUdeviceptr* d_ops = n_add ? calloc(n_add, sizeof(CUdeviceptr)) : NULL;
+    double result = -1.0;
+
+    if (!cu_check(cuMemAlloc(&d_a, ta->size * sizeof(float)), "time_kernel alloc a") ||
+        !cu_check(cuMemcpyHtoD(d_a, ta->data, ta->size * sizeof(float)), "time_kernel H2D a") ||
+        !cu_check(cuMemAlloc(&d_b, tb->size * sizeof(float)), "time_kernel alloc b") ||
+        !cu_check(cuMemcpyHtoD(d_b, tb->data, tb->size * sizeof(float)), "time_kernel H2D b") ||
+        !cu_check(cuMemAlloc(&d_out, (size_t)M * N * sizeof(float)), "time_kernel alloc out"))
+        goto cleanup;
+
+    {
+        int ai = 0;
+        for (int i = 0; i < root->n_epilogue; i++) {
+            if (root->epilogue[i].op != OP_ADD) continue;
+            Tensor* op = root->epilogue[i].operand->output;
+            if (!cu_check(cuMemAlloc(&d_ops[ai], op->size * sizeof(float)), "time_kernel alloc op") ||
+                !cu_check(cuMemcpyHtoD(d_ops[ai], op->data, op->size * sizeof(float)), "time_kernel H2D op"))
+                goto cleanup;
+            ai++;
+        }
+    }
+
+    {
+        int tile = tile_for(g, root);
+        char* ptx = emit_ptx_tiled(root, tile);
+        CUmodule mod = cache_lookup(&g->mod_cache, ptx);
+        CUfunction fn = NULL;
+        if (mod) {
+            free(ptx);
+        } else {
+            if (!cu_check(cuModuleLoadDataEx(&mod, ptx, 0, NULL, NULL), "time_kernel cuModuleLoadDataEx")) {
+                free(ptx);
+                goto cleanup;
+            }
+            cache_insert(&g->mod_cache, ptx, mod);
+        }
+        if (!cu_check(cuModuleGetFunction(&fn, mod, "fused"), "time_kernel cuModuleGetFunction"))
+            goto cleanup;
+
+        for (int w = 0; w < warmup; w++) {
+            launch_fused(fn, tile, M, N, K, d_a, d_b, d_ops, n_add, d_out);
+            cuCtxSynchronize();
+        }
+
+        CUevent t0, t1;
+        cuEventCreate(&t0, CU_EVENT_DEFAULT);
+        cuEventCreate(&t1, CU_EVENT_DEFAULT);
+        double best = 1e30;
+        for (int r = 0; r < reps; r++) {
+            cuEventRecord(t0, 0);
+            launch_fused(fn, tile, M, N, K, d_a, d_b, d_ops, n_add, d_out);
+            cuEventRecord(t1, 0);
+            cuEventSynchronize(t1);
+            float ms; cuEventElapsedTime(&ms, t0, t1);
+            if (ms < best) best = ms;
+        }
+        cuEventDestroy(t0); cuEventDestroy(t1);
+        result = best;
+    }
+
+cleanup:
+    if (d_a) cuMemFree(d_a);
+    if (d_b) cuMemFree(d_b);
+    if (d_out) cuMemFree(d_out);
+    if (d_ops) {
+        for (int i = 0; i < n_add; i++) if (d_ops[i]) cuMemFree(d_ops[i]);
+        free(d_ops);
+    }
+    return result;
+}
+
 // ---- gpu_execute ----
 
 static int node_index(Node** nodes, int n, const Node* target) {
