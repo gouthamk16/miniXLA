@@ -203,6 +203,34 @@ GPU0 → GPU1 → GPU2 → GPU3
 
 ---
 
+### Phase 9: Tensor Cores and the PyTorch Comparison (status, not a plan)
+
+**Objective:** actually attempt to beat PyTorch, on both speed and memory,
+having built enough of the compiler (Phases 1-7) to make the attempt honest.
+
+**What happened**, full detail in
+[`docs/research/tensorcore-and-fusion.md`](docs/research/tensorcore-and-fusion.md):
+a real TF32 tensor-core kernel (`mma.sync`, PTX ISA fragment layout,
+correctness-verified) landed additively alongside the existing CUDA-core
+emitter, but tops out at 51.4% of cuBLAS — behind the CUDA-core kernel it
+sits next to, not ahead of it. Separately, MiniXLA's fused single-launch
+execution of `matmul → add → relu` was measured against PyTorch eager:
+**a real, whole-size-range win on peak GPU memory** (no intermediate
+tensors ever materialize), and **a narrow win on latency only at the
+smallest size tested** (128×128, ~21% faster) — PyTorch eager wins at
+every other size measured. Neither raw GEMM nor general-size latency beats
+PyTorch; memory does.
+
+**Could do later:** shared-memory blocking for the tensor-core kernel hit
+a real bug scaling the block tile past 32×32 (documented in the research
+doc, a fixable cooperative-load assumption, not a fragment-layout issue);
+warp-tiling (siboehm's kernel 10) as a lower-risk CUDA-core-only lever
+never attempted this session; profiling `gpu_execute` under repeated calls
+to check whether a buffer pool is actually load-bearing before building
+one speculatively.
+
+---
+
 ## Tech Stack
 
 | Layer | Choice |

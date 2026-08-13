@@ -209,7 +209,7 @@
 
     <div class="stat-row">
       <div class="stat-tile">
-        <div class="stat-value">25 / 25</div>
+        <div class="stat-value">27 / 27</div>
         <div class="stat-label">tests passing on real CPU + GPU hardware</div>
       </div>
       <div class="stat-tile">
@@ -260,13 +260,16 @@
 
   <section id="correctness">
     <span class="eyebrow">Correctness</span>
-    <h2>26 tests, run against real hardware, not mocked</h2>
+    <h2>27 tests, run against real hardware, not mocked</h2>
     <p class="lede">18 CPU tests (<code class="mono">gcc</code>, includes a
-      <code class="mono">ptxas</code>-validated codegen check) and 8 GPU
+      <code class="mono">ptxas</code>-validated codegen check) and 9 GPU
       tests (<code class="mono">nvcc</code>, actually execute generated PTX
       on the RTX 4060 and compare against the CPU reference to 1e-4–1e-2
-      depending on scale). Every number in this report comes from a binary
-      built from the same source as these tests.</p>
+      depending on scale, including two for the tensor-core kernel against a
+      tolerance that scales with K &mdash; see
+      <a href="research/tensorcore-and-fusion.md">the research doc</a>).
+      Every number in this report comes from a binary built from the same
+      source as these tests.</p>
 
     <div class="panel">
       <h3>The two bugs a DAG-shaped test found that a chain-shaped one couldn't</h3>
@@ -402,15 +405,49 @@
         <svg class="chart" id="chart-fusion" viewBox="0 0 720 300" role="img" aria-label="Fusion epilogue overhead: matmul-only vs fused, by size"></svg>
       </div>
       <div class="legend" id="legend-fusion"></div>
-      <p class="note" style="margin-top:1rem"><b style="color:var(--ink)">The updated picture vs. PyTorch's unfused eager sequence:</b>
-        MiniXLA's fused kernel is now <em>faster</em> than PyTorch's unfused
-        3-kernel sequence at 128×128 (1.13×), small enough that per-launch
+      <p class="note" style="margin-top:1rem"><b style="color:var(--ink)">The updated picture vs. PyTorch's unfused eager sequence</b> (refreshed
+        in a later session, process-isolated, matched warmup protocol on both sides after an
+        early PyTorch reading turned out to be under-warmed for this GPU's clock-ramp behavior
+        &mdash; see <a href="research/tensorcore-and-fusion.md">full writeup</a>):
+        MiniXLA's fused kernel is <em>faster</em> than PyTorch's unfused
+        3-kernel sequence at 128×128 (1.21×), small enough that per-launch
         overhead dominates and fusion's launch-count reduction wins outright,
-        then behind at every larger size measured (1.12×–1.72×, worst at
+        then behind at every larger size measured (1.10×–1.61×, worst at
         512×512), converging back toward parity by 2048×2048. Fusion is a
         real, working lever; it's not yet enough on its own to beat a
         cuBLAS/cuDNN-backed unfused sequence once problems are big enough
         that raw compute efficiency dominates over launch overhead.</p>
+    </div>
+
+    <div class="chart-card panel">
+      <h3>The real whole-range win: peak GPU memory, not speed</h3>
+      <p class="note">Same op (<code class="mono">relu(matmul(a,b)+c)</code>), same isolated
+        methodology: MiniXLA's single fused kernel never materializes the two intermediate
+        M×N tensors PyTorch eager's 3 separate ops each produce, so it uses less peak device
+        memory <b>at every size tested</b>, not just the smallest. <code class="mono">cuMemGetInfo</code>
+        delta around MiniXLA's real (unpooled) <code class="mono">cuMemAlloc</code> calls vs.
+        PyTorch's own <code class="mono">max_memory_allocated()</code> &mdash; not identically-defined
+        numbers (PyTorch's reflects its caching allocator's bookkeeping on top of the same
+        raw need), but the real number each platform's user actually sees.</p>
+      <div class="table-scroll">
+      <table>
+        <thead><tr><th>Size</th><th class="num">MiniXLA peak mem</th><th class="num">PyTorch peak mem</th><th class="num">MiniXLA uses</th></tr></thead>
+        <tbody>
+          <tr><td>128×128</td><td class="num">2.0 MiB</td><td class="num">8.4 MiB</td><td class="num">4.22× less</td></tr>
+          <tr><td>256×256</td><td class="num">2.0 MiB</td><td class="num">9.4 MiB</td><td class="num">4.69× less</td></tr>
+          <tr><td>512×512</td><td class="num">4.0 MiB</td><td class="num">13.1 MiB</td><td class="num">3.28× less</td></tr>
+          <tr><td>1024×1024</td><td class="num">16.0 MiB</td><td class="num">28.1 MiB</td><td class="num">1.76× less</td></tr>
+          <tr><td>2048×2048</td><td class="num">64.0 MiB</td><td class="num">88.1 MiB</td><td class="num">1.38× less</td></tr>
+        </tbody>
+      </table>
+      </div>
+      <p class="note" style="margin-top:1rem">This is the one place in this whole report MiniXLA
+        beats PyTorch across the board, not at one favorable size. A follow-up session also
+        added a real TF32 tensor-core kernel (<code class="mono">mma.sync</code>, additive,
+        alongside the CUDA-core one above) aimed at the raw-GEMM gap; it's correctness-verified
+        but tops out at 51.4% of cuBLAS &mdash; behind the CUDA-core kernel it sits next to, not
+        ahead of it. Full detail, including two tuning attempts that made it slower, in the
+        same <a href="research/tensorcore-and-fusion.md">research doc</a>.</p>
     </div>
   </section>
 
