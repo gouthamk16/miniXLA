@@ -110,7 +110,7 @@
   .masthead-meta b { color: var(--ink-soft); font-weight: 600; }
 
   .stat-row {
-    display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px;
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px;
     background: var(--rule); border: 1px solid var(--rule);
     border-radius: 10px; overflow: hidden; margin-top: 2rem;
   }
@@ -190,6 +190,9 @@
   @media (max-width: 640px) {
     .stat-row { grid-template-columns: repeat(2, 1fr); }
   }
+  @media (min-width: 641px) and (max-width: 900px) {
+    .stat-row { grid-template-columns: repeat(3, 1fr); }
+  }
 </style>
 
 <div class="wrap">
@@ -204,7 +207,7 @@
       <span><b>Hardware</b> NVIDIA GeForce RTX 4060 Laptop GPU, CUDA 12.6</span>
       <span><b>Compilers</b> gcc 6.3.0 (CPU), nvcc 12.6 / MSVC (GPU)</span>
       <span><b>Baselines</b> cuBLAS 12.6, PyTorch 2.13.0+cu126</span>
-      <span><b>Report date</b> 2026-08-13</span>
+      <span><b>Report date</b> 2026-08-14</span>
     </div>
 
     <div class="stat-row">
@@ -215,6 +218,10 @@
       <div class="stat-tile">
         <div class="stat-value">84%</div>
         <div class="stat-label">of cuBLAS at 2048³, up from 8% at session start</div>
+      </div>
+      <div class="stat-tile">
+        <div class="stat-value">4.7×</div>
+        <div class="stat-label">less peak GPU memory than PyTorch eager, best case &mdash; a win at every size tested</div>
       </div>
       <div class="stat-tile">
         <div class="stat-value">4</div>
@@ -429,6 +436,10 @@
         PyTorch's own <code class="mono">max_memory_allocated()</code> &mdash; not identically-defined
         numbers (PyTorch's reflects its caching allocator's bookkeeping on top of the same
         raw need), but the real number each platform's user actually sees.</p>
+      <div class="chart-scroll">
+        <svg class="chart" id="chart-memory" viewBox="0 0 720 300" role="img" aria-label="Peak GPU memory in MiB by size, log scale: MiniXLA fused vs PyTorch eager"></svg>
+      </div>
+      <div class="legend" id="legend-memory"></div>
       <div class="table-scroll">
       <table>
         <thead><tr><th>Size</th><th class="num">MiniXLA peak mem</th><th class="num">PyTorch peak mem</th><th class="num">MiniXLA uses</th></tr></thead>
@@ -593,5 +604,10 @@ python bench_pytorch.py</pre>
     { name: 'MiniXLA fused (matmul+bias+relu)', color: 'var(--s8)', values: [0.0389, 0.0634, 0.1219, 0.4690, 3.0434] },
     { name: 'PyTorch unfused (3 kernels)', color: 'var(--s2)', values: [0.0440, 0.0399, 0.0707, 0.3676, 2.7259] }
   ], { unit: 'ms', height: 300 });
+
+  drawLineChart('chart-memory', 'legend-memory', [
+    { name: 'MiniXLA fused (matmul+bias+relu)', color: 'var(--s8)', values: [2.0, 2.0, 4.0, 16.0, 64.0] },
+    { name: 'PyTorch eager (3 kernels)', color: 'var(--s2)', values: [8.4, 9.4, 13.1, 28.1, 88.1] }
+  ], { unit: ' MiB', height: 300 });
 })();
 </script>

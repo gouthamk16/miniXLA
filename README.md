@@ -10,7 +10,8 @@ show up on DAGs (shared nodes, fused epilogues) rather than straight chains.
 It started out not trying to beat PyTorch or XLA; a later session did try, honestly, on both
 speed and memory. Measured kernel throughput vs cuBLAS is in
 [the benchmark report](docs/bench_report.html), including where MiniXLA is far behind — and the
-memory/latency-vs-PyTorch-eager results below, including the one place it's genuinely ahead.
+memory/latency-vs-PyTorch-eager results below: behind on latency except at one small size,
+but **using less peak GPU memory than PyTorch eager at every size tested, 1.4×-4.7× less.**
 
 The phase roadmap and unfinished ideas live in [`idea.md`](idea.md). This
 README is what actually exists.
