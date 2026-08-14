@@ -245,6 +245,8 @@ one speculatively.
 
 ## Repository Structure
 
+Sketched at inception, and **not** what got built:
+
 ```
 MiniXLA/
 │
@@ -263,6 +265,15 @@ MiniXLA/
 ├── docs/
 └── CMakeLists.txt
 ```
+
+The real tree is flat, with `docs/` the only subdirectory. At ~3,900 lines
+across 21 files this would be six directories holding two files each, and
+the file names (`tensor.c`, `graph.c`, `optimizer.c`, …) already carry the
+grouping the tree was going to express. CMake likewise didn't survive
+contact: the CPU targets build with `gcc` and the GPU targets with `nvcc`
+(MSVC host), which is two toolchains in one project, and there's no
+object-file step to make incremental. `build.sh` covers it in 30 lines.
+See `README.md`'s Layout section for what's actually there.
 
 ---
 

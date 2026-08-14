@@ -146,23 +146,30 @@ runtime (`nvcc` uses MSVC as the host compiler on Windows and compiles this
 C99 as-is). Benchmarks also want cuBLAS (CUDA toolkit) and, for the PyTorch
 points, a Python env with `torch`.
 
+`build.sh` wraps every target so the source list lives in one place:
+
 ```sh
-# CPU demo
-gcc -O2 -Wall -o demo main.c graph.c tensor.c optimizer.c -lm
-./demo
+./build.sh test        # build + run both suites -- the one to run before committing
+./build.sh demo        # CPU demo
+./build.sh gpu-test    # GPU suite: assemble PTX, run it, compare to CPU (1e-4 … 1e-2)
+./build.sh bench       # benchmark harness vs cuBLAS
+./build.sh bench-loop  # lighter single-size harness for the autoresearch loop
+./build.sh all         # demo + tests + gpu_test + bench
+./build.sh clean
+```
 
-# CPU tests: graph, optimizer, autodiff, ptxas-validated codegen
-gcc -O2 -Wall -o tests tests.c graph.c tensor.c optimizer.c ptx.c autodiff.c -lm
-./tests
+It's a shell script rather than a Makefile deliberately: every target compiles
+straight from sources with no object-file step, and `gcc`/`nvcc` here are two
+different toolchains rather than one with different flags, so there's nothing
+incremental for `make` to manage. The underlying commands are plain, to run
+directly or to adapt:
 
-# GPU tests: assemble PTX, run it, compare to CPU (1e-4 … 1e-2)
-nvcc -o gpu_test gpu_test.c graph.c tensor.c optimizer.c ptx.c runtime.c gpu_exec.c -lcuda
-./gpu_test
-
-# Benchmarks vs cuBLAS, then vs PyTorch
-nvcc -O2 -o bench bench.c graph.c tensor.c optimizer.c ptx.c gpu_exec.c -lcuda -lcublas
-./bench
-python bench_pytorch.py
+```sh
+gcc  -O2 -Wall -o demo     main.c     graph.c tensor.c optimizer.c -lm
+gcc  -O2 -Wall -o tests    tests.c    graph.c tensor.c optimizer.c ptx.c autodiff.c -lm
+nvcc           -o gpu_test gpu_test.c graph.c tensor.c optimizer.c ptx.c runtime.c gpu_exec.c -lcuda
+nvcc -O2       -o bench    bench.c    graph.c tensor.c optimizer.c ptx.c gpu_exec.c -lcuda -lcublas
+python bench_pytorch.py    # the PyTorch comparison points
 ```
 
 18 CPU tests, 9 GPU tests (including a diamond DAG that caught two shipped
@@ -186,6 +193,12 @@ is done: the two backends execute the same optimized graphs.
 | `tests.c` | CPU suite |
 | `gpu_test.c` | GPU suite |
 | `bench.c` / `bench_pytorch.py` | Numbers behind the report |
+| `bench_loop.c` | Single-size harness for the autoresearch loop |
+| `build.sh` | Build/run targets |
+
+Flat on purpose. At ~3,900 lines across 21 files, the `src/tensor/`,
+`src/graph/`, … tree sketched in `idea.md` would be six directories holding
+two files each; the file names already carry that grouping.
 
 ## Docs
 

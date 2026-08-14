@@ -3,3 +3,12 @@
 *.pdb
 *.ilk
 *.obj
+*.exp
+*.lib
+
+# Same binaries, built without the .exe suffix off Windows
+demo
+tests
+gpu_test
+bench
+bench_loop
